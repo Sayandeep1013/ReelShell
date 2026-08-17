@@ -6,15 +6,22 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Sayandeep1013/ReelShell/internal/config"
 	"github.com/Sayandeep1013/ReelShell/internal/discovery"
 	"github.com/Sayandeep1013/ReelShell/internal/player"
 )
+
+// searchDebounce is how long to wait after the last keystroke before firing
+// a real TMDB search request (IMPLEMENTATION_PLAN.md, v0 error table:
+// avoids hitting TMDB's rate limit on every keystroke).
+const searchDebounce = 350 * time.Millisecond
 
 // movieItem adapts discovery.Movie to bubbles/list's list.Item interface.
 type movieItem struct {
@@ -40,6 +47,20 @@ type trendingLoadedMsg struct {
 	err    error
 }
 
+type searchResultsMsg struct {
+	query  string
+	movies []discovery.Movie
+	err    error
+}
+
+// debounceFireMsg carries a generation number; if it doesn't match the
+// model's current generation, a newer keystroke has arrived since this
+// timer was scheduled and the search is stale, so it's dropped.
+type debounceFireMsg struct {
+	gen   int
+	query string
+}
+
 type model struct {
 	cfg      *config.Config
 	tmdb     *discovery.TMDBClient
@@ -47,19 +68,30 @@ type model struct {
 	loading  bool
 	loadErr  error
 	list     list.Model
+
+	searching   bool
+	searchInput textinput.Model
+	searchGen   int
+	searchErr   error
 }
 
 func initialModel(cfg *config.Config) model {
 	l := list.New(nil, list.NewDefaultDelegate(), 0, 0)
 	l.Title = "Trending Movies"
 	l.SetShowStatusBar(false)
+	l.SetShowFilter(false) // we drive search ourselves against TMDB, not the built-in local filter
+
+	ti := textinput.New()
+	ti.Placeholder = "search movies…"
+	ti.Prompt = "/ "
 
 	return model{
-		cfg:      cfg,
-		tmdb:     discovery.NewTMDBClient(cfg.TMDB.APIKey),
-		mpvFound: player.CheckAvailable(cfg.MPV.Path),
-		loading:  true,
-		list:     l,
+		cfg:         cfg,
+		tmdb:        discovery.NewTMDBClient(cfg.TMDB.APIKey),
+		mpvFound:    player.CheckAvailable(cfg.MPV.Path),
+		loading:     true,
+		list:        l,
+		searchInput: ti,
 	}
 }
 
@@ -68,6 +100,27 @@ func fetchTrending(tmdb *discovery.TMDBClient) tea.Cmd {
 		movies, err := tmdb.TrendingMovies()
 		return trendingLoadedMsg{movies: movies, err: err}
 	}
+}
+
+func fetchSearch(tmdb *discovery.TMDBClient, query string) tea.Cmd {
+	return func() tea.Msg {
+		movies, err := tmdb.SearchMovies(query)
+		return searchResultsMsg{query: query, movies: movies, err: err}
+	}
+}
+
+func scheduleDebounce(gen int, query string) tea.Cmd {
+	return tea.Tick(searchDebounce, func(time.Time) tea.Msg {
+		return debounceFireMsg{gen: gen, query: query}
+	})
+}
+
+func setMovieItems(l *list.Model, movies []discovery.Movie) {
+	items := make([]list.Item, len(movies))
+	for i, mv := range movies {
+		items[i] = movieItem{movie: mv}
+	}
+	l.SetItems(items)
 }
 
 func (m model) Init() tea.Cmd {
@@ -86,17 +139,55 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadErr = msg.err
 			return m, nil
 		}
-		items := make([]list.Item, len(msg.movies))
-		for i, mv := range msg.movies {
-			items[i] = movieItem{movie: mv}
-		}
-		m.list.SetItems(items)
+		setMovieItems(&m.list, msg.movies)
 		return m, nil
 
+	case searchResultsMsg:
+		if msg.query != m.searchInput.Value() {
+			return m, nil // stale result from an earlier query, drop it
+		}
+		if msg.err != nil {
+			m.searchErr = msg.err
+			return m, nil
+		}
+		m.searchErr = nil
+		m.list.Title = "Search: " + msg.query
+		setMovieItems(&m.list, msg.movies)
+		return m, nil
+
+	case debounceFireMsg:
+		if msg.gen != m.searchGen || msg.query == "" {
+			return m, nil // superseded by a newer keystroke, or empty query
+		}
+		return m, fetchSearch(m.tmdb, msg.query)
+
 	case tea.KeyMsg:
+		if m.searching {
+			switch msg.String() {
+			case "esc":
+				m.searching = false
+				m.searchInput.Blur()
+				m.searchInput.SetValue("")
+				m.list.Title = "Trending Movies"
+				m.searchErr = nil
+				return m, fetchTrending(m.tmdb)
+			case "ctrl+c":
+				return m, tea.Quit
+			}
+
+			var cmd tea.Cmd
+			m.searchInput, cmd = m.searchInput.Update(msg)
+			m.searchGen++
+			return m, tea.Batch(cmd, scheduleDebounce(m.searchGen, m.searchInput.Value()))
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "/":
+			m.searching = true
+			m.searchInput.Focus()
+			return m, textinput.Blink
 		}
 	}
 
@@ -121,14 +212,28 @@ func (m model) View() string {
 
 	header := titleStyle.Render("ReelShell") + "  " + status + "\n\n"
 
+	if m.searching {
+		header += m.searchInput.View() + "\n\n"
+	}
+
 	if m.loading {
 		return header + dimStyle.Render("loading trending movies…") + "\n"
 	}
 	if m.loadErr != nil {
 		return header + errStyle.Render("failed to load trending movies: "+m.loadErr.Error()) + "\n"
 	}
+	if m.searchErr != nil {
+		header += errStyle.Render("search failed: "+m.searchErr.Error()) + "\n\n"
+	}
 
-	return header + m.list.View() + "\n" + dimStyle.Render("press q to quit") + "\n"
+	footer := dimStyle.Render("press q to quit")
+	if !m.searching {
+		footer = dimStyle.Render("/ search • press q to quit")
+	} else {
+		footer = dimStyle.Render("esc to cancel search")
+	}
+
+	return header + m.list.View() + "\n" + footer + "\n"
 }
 
 func main() {

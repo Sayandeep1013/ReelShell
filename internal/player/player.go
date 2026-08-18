@@ -4,15 +4,25 @@
 package player
 
 import (
+	"bytes"
 	_ "embed"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Sayandeep1013/ReelShell/internal/config"
 	"github.com/Sayandeep1013/ReelShell/internal/provider"
 )
+
+// minPlayDuration: if mpv exits before this much time has passed, the
+// stream almost certainly never actually played (dead link, blocked,
+// unsupported format) rather than the user just finishing a very short
+// clip — so it's treated as a failure (IMPLEMENTATION_PLAN.md, v0 error
+// table) instead of being silently marked "watched".
+const minPlayDuration = 5 * time.Second
 
 //go:embed input.conf
 var inputConf []byte
@@ -56,5 +66,25 @@ func Play(mpvPath string, res *provider.ResolveResponse) error {
 	}
 
 	cmd := exec.Command(mpvPath, args...)
-	return cmd.Run()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	start := time.Now()
+	err := cmd.Run()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		return fmt.Errorf("mpv exited with error: %w (stderr: %s)", err, tail(stderr.String(), 500))
+	}
+	if elapsed < minPlayDuration {
+		return fmt.Errorf("mpv exited after only %s — the stream likely never played (stderr: %s)", elapsed.Round(time.Millisecond), tail(stderr.String(), 500))
+	}
+	return nil
+}
+
+func tail(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return "…" + s[len(s)-maxLen:]
 }

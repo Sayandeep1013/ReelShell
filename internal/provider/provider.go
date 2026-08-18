@@ -8,9 +8,11 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"time"
 )
 
 type ResolveRequest struct {
@@ -47,6 +49,40 @@ func Resolve(providerExe string, req ResolveRequest) (*ResolveResponse, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("provider %s failed: %w (stderr: %s)", providerExe, err, stderr.String())
+	}
+
+	var resp ResolveResponse
+	if err := json.Unmarshal(stdout.Bytes(), &resp); err != nil {
+		return nil, fmt.Errorf("provider %s returned invalid JSON: %w", providerExe, err)
+	}
+	return &resp, nil
+}
+
+// ResolveWithTimeout is Resolve, but kills the provider subprocess if it
+// hasn't responded within timeout (IMPLEMENTATION_PLAN.md, v0 error table:
+// a hung/unresponsive source site must not freeze the UI indefinitely).
+func ResolveWithTimeout(providerExe string, req ResolveRequest, timeout time.Duration) (*ResolveResponse, error) {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, providerExe, "resolve")
+	cmd.Stdin = bytes.NewReader(payload)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err = cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("provider %s timed out after %s", providerExe, timeout)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("provider %s failed: %w (stderr: %s)", providerExe, err, stderr.String())
 	}
 

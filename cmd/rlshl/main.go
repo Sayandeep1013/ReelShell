@@ -16,12 +16,26 @@ import (
 	"github.com/Sayandeep1013/ReelShell/internal/config"
 	"github.com/Sayandeep1013/ReelShell/internal/discovery"
 	"github.com/Sayandeep1013/ReelShell/internal/player"
+	"github.com/Sayandeep1013/ReelShell/internal/provider"
 )
 
 // searchDebounce is how long to wait after the last keystroke before firing
 // a real TMDB search request (IMPLEMENTATION_PLAN.md, v0 error table:
 // avoids hitting TMDB's rate limit on every keystroke).
 const searchDebounce = 350 * time.Millisecond
+
+// resolveTimeout bounds how long a provider gets to resolve a stream before
+// it's treated as failed (IMPLEMENTATION_PLAN.md, v0 error table: a hung
+// provider must not freeze the UI).
+const resolveTimeout = 15 * time.Second
+
+type screen int
+
+const (
+	screenBrowsing screen = iota
+	screenDetail
+	screenResolving
+)
 
 // movieItem adapts discovery.Movie to bubbles/list's list.Item interface.
 type movieItem struct {
@@ -61,6 +75,10 @@ type debounceFireMsg struct {
 	query string
 }
 
+type playFinishedMsg struct {
+	err error
+}
+
 type model struct {
 	cfg      *config.Config
 	tmdb     *discovery.TMDBClient
@@ -73,6 +91,11 @@ type model struct {
 	searchInput textinput.Model
 	searchGen   int
 	searchErr   error
+
+	screen      screen
+	selected    discovery.Movie
+	resolveErr  error
+	playErr     error
 }
 
 func initialModel(cfg *config.Config) model {
@@ -92,6 +115,7 @@ func initialModel(cfg *config.Config) model {
 		loading:     true,
 		list:        l,
 		searchInput: ti,
+		screen:      screenBrowsing,
 	}
 }
 
@@ -113,6 +137,38 @@ func scheduleDebounce(gen int, query string) tea.Cmd {
 	return tea.Tick(searchDebounce, func(time.Time) tea.Msg {
 		return debounceFireMsg{gen: gen, query: query}
 	})
+}
+
+// resolveAndPlay runs the configured movie provider, then hands the result
+// to mpv. Both steps happen inside one tea.Cmd so the TUI stays responsive
+// while a real subprocess/mpv window runs in the background.
+func resolveAndPlay(cfg *config.Config, movie discovery.Movie) tea.Cmd {
+	return func() tea.Msg {
+		if len(cfg.Providers.Movie) == 0 {
+			return playFinishedMsg{err: fmt.Errorf("no movie provider configured")}
+		}
+		providerExe := cfg.Providers.Movie[0]
+
+		req := provider.ResolveRequest{Type: "movie", Title: movie.Title, Year: yearInt(movie.Year)}
+		res, err := provider.ResolveWithTimeout(providerExe, req, resolveTimeout)
+		if err != nil {
+			return playFinishedMsg{err: err}
+		}
+		if !res.OK {
+			return playFinishedMsg{err: fmt.Errorf("provider: %s", res.Error)}
+		}
+
+		if err := player.Play(cfg.MPV.Path, res); err != nil {
+			return playFinishedMsg{err: fmt.Errorf("mpv: %w", err)}
+		}
+		return playFinishedMsg{err: nil}
+	}
+}
+
+func yearInt(dateStr string) int {
+	var y int
+	fmt.Sscanf(dateStr, "%4d", &y)
+	return y
 }
 
 func setMovieItems(l *list.Model, movies []discovery.Movie) {
@@ -161,26 +217,67 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, fetchSearch(m.tmdb, msg.query)
 
-	case tea.KeyMsg:
-		if m.searching {
-			switch msg.String() {
-			case "esc":
-				m.searching = false
-				m.searchInput.Blur()
-				m.searchInput.SetValue("")
-				m.list.Title = "Trending Movies"
-				m.searchErr = nil
-				return m, fetchTrending(m.tmdb)
-			case "ctrl+c":
-				return m, tea.Quit
-			}
+	case playFinishedMsg:
+		m.playErr = msg.err
+		m.screen = screenDetail
+		return m, nil
 
-			var cmd tea.Cmd
-			m.searchInput, cmd = m.searchInput.Update(msg)
-			m.searchGen++
-			return m, tea.Batch(cmd, scheduleDebounce(m.searchGen, m.searchInput.Value()))
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+	}
+
+	var cmd tea.Cmd
+	m.list, cmd = m.list.Update(msg)
+	return m, cmd
+}
+
+func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.searching {
+		switch msg.String() {
+		case "esc":
+			m.searching = false
+			m.searchInput.Blur()
+			m.searchInput.SetValue("")
+			m.list.Title = "Trending Movies"
+			m.searchErr = nil
+			return m, fetchTrending(m.tmdb)
+		case "ctrl+c":
+			return m, tea.Quit
 		}
 
+		var cmd tea.Cmd
+		m.searchInput, cmd = m.searchInput.Update(msg)
+		m.searchGen++
+		return m, tea.Batch(cmd, scheduleDebounce(m.searchGen, m.searchInput.Value()))
+	}
+
+	switch m.screen {
+	case screenDetail:
+		switch msg.String() {
+		case "esc", "backspace":
+			m.screen = screenBrowsing
+			m.playErr = nil
+			return m, nil
+		case "enter", "p":
+			if !m.mpvFound {
+				m.playErr = fmt.Errorf("mpv not on PATH, can't play")
+				return m, nil
+			}
+			m.screen = screenResolving
+			m.playErr = nil
+			return m, resolveAndPlay(m.cfg, m.selected)
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		}
+		return m, nil
+
+	case screenResolving:
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		return m, nil // ignore input while a resolve/play is in flight
+
+	default: // screenBrowsing
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -188,6 +285,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.searching = true
 			m.searchInput.Focus()
 			return m, textinput.Blink
+		case "enter":
+			if item, ok := m.list.SelectedItem().(movieItem); ok {
+				m.selected = item.movie
+				m.screen = screenDetail
+			}
+			return m, nil
 		}
 	}
 
@@ -209,13 +312,18 @@ func (m model) View() string {
 	if !m.mpvFound {
 		status = warnStyle.Render("mpv: NOT on PATH — install it before playback will work")
 	}
-
 	header := titleStyle.Render("ReelShell") + "  " + status + "\n\n"
+
+	switch m.screen {
+	case screenDetail:
+		return header + m.detailView()
+	case screenResolving:
+		return header + "resolving \"" + m.selected.Title + "\"…\n\n" + dimStyle.Render("this may take a few seconds")
+	}
 
 	if m.searching {
 		header += m.searchInput.View() + "\n\n"
 	}
-
 	if m.loading {
 		return header + dimStyle.Render("loading trending movies…") + "\n"
 	}
@@ -226,14 +334,22 @@ func (m model) View() string {
 		header += errStyle.Render("search failed: "+m.searchErr.Error()) + "\n\n"
 	}
 
-	footer := dimStyle.Render("press q to quit")
-	if !m.searching {
-		footer = dimStyle.Render("/ search • press q to quit")
-	} else {
+	footer := dimStyle.Render("enter: details • / search • q quit")
+	if m.searching {
 		footer = dimStyle.Render("esc to cancel search")
 	}
-
 	return header + m.list.View() + "\n" + footer + "\n"
+}
+
+func (m model) detailView() string {
+	body := titleStyle.Render(m.selected.Title) + "\n"
+	body += fmt.Sprintf("★ %.1f\n\n", m.selected.Rating)
+	body += m.selected.Overview + "\n\n"
+	if m.playErr != nil {
+		body += errStyle.Render("play failed: "+m.playErr.Error()) + "\n\n"
+	}
+	body += dimStyle.Render("enter/p: play • esc: back • q: quit")
+	return body
 }
 
 func main() {

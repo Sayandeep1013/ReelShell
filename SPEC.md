@@ -133,10 +133,16 @@ api_key = ""
 path = ""          # empty = auto-detect on PATH
 
 [providers]
-movie = ["G:\\ReelShell\\providers\\movie-provider.exe"]
+movie = ["G:\\ReelShell\\providers\\movie-provider.exe", "G:\\ReelShell\\providers\\movie-provider-2.exe"]
 tv    = ["G:\\ReelShell\\providers\\tv-provider.exe"]
 anime = ["G:\\ReelShell\\providers\\anime-nyaa.exe"]
 ```
+
+**Provider selection UX (v2).** Two mechanisms, layered:
+- **Automatic fallback**: `resolveAndPlay` tries every configured provider for a Kind in order, stopping at the first success. Silent, no user interaction.
+- **Preferred-provider toggle**: `n` on the detail screen cycles which provider is tried *first*, per content Kind, for the current session (not persisted to `config.toml`). The rest of the list still acts as fallback underneath. This was chosen over a dedicated provider-picker screen (more control, but another screen/more friction) and over cycle-only-on-failure (purely reactive, no way to pre-express a preference) — see `IMPLEMENTATION_PLAN.md` for the fuller trade-off writeup.
+
+This was designed after real research into comparable OSS tools: `pystardust/ani-cli` (anime, 13.5k★) remains the actively-maintained reference for a single well-chosen source. On the movie/TV side, both dedicated CLI tools found (`movie-cli`, `mov-cli`) turned out to be unmaintained/archived — a signal that betting on any single source or tool in this space is fragile, which is exactly what the automatic multi-provider fallback (already built pre-toggle) is for.
 
 ## 6. Dependencies
 

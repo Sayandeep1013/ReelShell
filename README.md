@@ -16,4 +16,4 @@ This repo is the public framework only — the TUI, discovery-layer clients (TMD
 
 ## Status
 
-**v0 complete** — real TMDB trending/search, movie detail screen, and full resolve→mpv playback verified end to end (see `cmd/rlshl/main_test.go`). Playback currently goes through a dummy provider that always returns a public-domain test clip; a real movie provider (private repo) is next, alongside v1 (TV/anime tabs, history, real provider protocol).
+**v0 and v1 complete.** Movies/TV/Anime tabs (TMDB + AniList), search, season/episode picker, sub/dub toggle with auto-fallback, watch history + continue-watching, and full resolve→mpv playback all verified end to end. Playback still goes through a dummy provider that always returns a public-domain test clip — a real provider (private repo) is the next real gap, alongside v2 (fuzzy search, caching, multi-provider fallback, torrent provider example).

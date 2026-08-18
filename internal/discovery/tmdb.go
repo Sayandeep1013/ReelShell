@@ -41,6 +41,25 @@ type tmdbTVList struct {
 	Results []TVShow `json:"results"`
 }
 
+type TVSeason struct {
+	SeasonNumber int    `json:"season_number"`
+	EpisodeCount int    `json:"episode_count"`
+	Name         string `json:"name"`
+}
+
+type tvDetails struct {
+	Seasons []TVSeason `json:"seasons"`
+}
+
+type TVEpisode struct {
+	EpisodeNumber int    `json:"episode_number"`
+	Name          string `json:"name"`
+}
+
+type tvSeasonDetails struct {
+	Episodes []TVEpisode `json:"episodes"`
+}
+
 type tmdbErrorBody struct {
 	StatusMessage string `json:"status_message"`
 	StatusCode    int    `json:"status_code"`
@@ -110,6 +129,38 @@ func (c *TMDBClient) SearchTV(query string) ([]TVShow, error) {
 		return nil, fmt.Errorf("tmdb: decoding tv search results: %w", err)
 	}
 	return list.Results, nil
+}
+
+// TVSeasons excludes season 0 (specials), which is usually noise for a
+// "pick a season to watch" flow.
+func (c *TMDBClient) TVSeasons(tvID int) ([]TVSeason, error) {
+	body, err := c.get(fmt.Sprintf("/tv/%d", tvID))
+	if err != nil {
+		return nil, err
+	}
+	var details tvDetails
+	if err := json.Unmarshal(body, &details); err != nil {
+		return nil, fmt.Errorf("tmdb: decoding tv seasons: %w", err)
+	}
+	var seasons []TVSeason
+	for _, s := range details.Seasons {
+		if s.SeasonNumber > 0 {
+			seasons = append(seasons, s)
+		}
+	}
+	return seasons, nil
+}
+
+func (c *TMDBClient) TVEpisodes(tvID, season int) ([]TVEpisode, error) {
+	body, err := c.get(fmt.Sprintf("/tv/%d/season/%d", tvID, season))
+	if err != nil {
+		return nil, err
+	}
+	var details tvSeasonDetails
+	if err := json.Unmarshal(body, &details); err != nil {
+		return nil, fmt.Errorf("tmdb: decoding tv episodes: %w", err)
+	}
+	return details.Episodes, nil
 }
 
 func (c *TMDBClient) get(path string) ([]byte, error) {

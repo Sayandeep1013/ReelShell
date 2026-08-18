@@ -16,6 +16,7 @@ import (
 
 	"github.com/Sayandeep1013/ReelShell/internal/config"
 	"github.com/Sayandeep1013/ReelShell/internal/discovery"
+	"github.com/Sayandeep1013/ReelShell/internal/history"
 	"github.com/Sayandeep1013/ReelShell/internal/player"
 	"github.com/Sayandeep1013/ReelShell/internal/poster"
 	"github.com/Sayandeep1013/ReelShell/internal/provider"
@@ -25,8 +26,14 @@ const searchDebounce = 350 * time.Millisecond
 const resolveTimeout = 15 * time.Second
 const posterMaxWidthPx = 180
 
+// continueWatchingCount: how many recently-watched items to prepend to a
+// tab's trending list. Kept small and simple for v1 — these entries carry
+// only title/id/kind (not a re-fetched poster/overview), a known
+// limitation, not an oversight.
+const continueWatchingCount = 3
+
 const (
-	headerRows = 5 // title/help, blank, tabs, search line, blank
+	headerRows = 5
 	appMargin  = 2
 )
 
@@ -48,20 +55,49 @@ type screen int
 const (
 	screenBrowsing screen = iota
 	screenDetail
+	screenSeasonPicker
+	screenEpisodePicker
 	screenResolving
 )
 
 type contentItem struct{ c discovery.Content }
 
 func (i contentItem) Title() string {
+	prefix := ""
+	if i.c.Continued {
+		prefix = "↻ "
+	}
 	year := ""
 	if len(i.c.Year) >= 4 {
 		year = " (" + i.c.Year[:4] + ")"
 	}
-	return i.c.Title + year
+	return prefix + i.c.Title + year
 }
-func (i contentItem) Description() string { return fmt.Sprintf("★ %.1f", i.c.Rating) }
+func (i contentItem) Description() string {
+	if i.c.Continued {
+		return "continue watching"
+	}
+	return fmt.Sprintf("★ %.1f", i.c.Rating)
+}
 func (i contentItem) FilterValue() string { return i.c.Title }
+
+type seasonItem struct{ s discovery.TVSeason }
+
+func (i seasonItem) Title() string       { return fmt.Sprintf("Season %d", i.s.SeasonNumber) }
+func (i seasonItem) Description() string { return fmt.Sprintf("%d episodes", i.s.EpisodeCount) }
+func (i seasonItem) FilterValue() string { return i.Title() }
+
+// episodeRef unifies TMDB's named TV episodes and AniList's numbered-only
+// anime episodes into one pickable shape.
+type episodeRef struct {
+	number int
+	label  string
+}
+type episodeItem struct{ e episodeRef }
+
+func (i episodeItem) Title() string       { return i.e.label }
+func (i episodeItem) Description() string { return "" }
+func (i episodeItem) FilterValue() string { return i.e.label }
 
 type trendingLoadedMsg struct {
 	tab   discovery.Kind
@@ -89,10 +125,23 @@ type posterLoadedMsg struct {
 	err       error
 }
 
+type seasonsLoadedMsg struct {
+	contentID int
+	seasons   []discovery.TVSeason
+	err       error
+}
+
+type episodesLoadedMsg struct {
+	contentID int
+	episodes  []episodeRef
+	err       error
+}
+
 type model struct {
 	cfg      *config.Config
 	tmdb     *discovery.TMDBClient
 	anilist  *discovery.AniListClient
+	history  *history.DB // nil if it failed to open — history features silently no-op
 	mpvFound bool
 
 	tab     discovery.Kind
@@ -114,6 +163,15 @@ type model struct {
 	posterSixel string
 	posterErr   error
 	playErr     error
+
+	seasonList    list.Model
+	seasonsErr    error
+	seasonsLoad   bool
+	selectedSeason discovery.TVSeason
+
+	episodeList  list.Model
+	episodesErr  error
+	episodesLoad bool
 }
 
 func compactDelegate() list.DefaultDelegate {
@@ -123,12 +181,24 @@ func compactDelegate() list.DefaultDelegate {
 	return d
 }
 
-func initialModel(cfg *config.Config) model {
+func initialModel(cfg *config.Config, hist *history.DB) model {
 	l := list.New(nil, compactDelegate(), 0, 0)
 	l.Title = "Trending"
 	l.SetShowStatusBar(false)
 	l.SetShowFilter(false)
 	l.SetShowHelp(false)
+
+	seasons := list.New(nil, compactDelegate(), 0, 0)
+	seasons.Title = "Seasons"
+	seasons.SetShowStatusBar(false)
+	seasons.SetShowFilter(false)
+	seasons.SetShowHelp(false)
+
+	episodes := list.New(nil, compactDelegate(), 0, 0)
+	episodes.Title = "Episodes"
+	episodes.SetShowStatusBar(false)
+	episodes.SetShowFilter(false)
+	episodes.SetShowHelp(false)
 
 	ti := textinput.New()
 	ti.Placeholder = "search…"
@@ -138,13 +208,31 @@ func initialModel(cfg *config.Config) model {
 		cfg:         cfg,
 		tmdb:        discovery.NewTMDBClient(cfg.TMDB.APIKey),
 		anilist:     discovery.NewAniListClient(),
+		history:     hist,
 		mpvFound:    player.CheckAvailable(cfg.MPV.Path),
 		tab:         discovery.KindMovie,
 		loading:     true,
 		list:        l,
+		seasonList:  seasons,
+		episodeList: episodes,
 		searchInput: ti,
 		screen:      screenBrowsing,
 	}
+}
+
+func (m model) recentlyWatched(tab discovery.Kind) []discovery.Content {
+	if m.history == nil {
+		return nil
+	}
+	entries, err := m.history.RecentlyWatched(string(tab), continueWatchingCount)
+	if err != nil {
+		return nil
+	}
+	items := make([]discovery.Content, len(entries))
+	for i, e := range entries {
+		items[i] = discovery.Content{Kind: tab, ID: e.ContentID, Title: e.Title, Continued: true}
+	}
+	return items
 }
 
 func (m model) fetchTrending(tab discovery.Kind) tea.Cmd {
@@ -171,6 +259,7 @@ func (m model) fetchTrending(tab discovery.Kind) tea.Cmd {
 				items = append(items, discovery.FromAnime(a))
 			}
 		}
+		items = append(m.recentlyWatched(tab), items...)
 		return trendingLoadedMsg{tab: tab, items: items, err: err}
 	}
 }
@@ -216,12 +305,44 @@ func fetchPoster(c discovery.Content) tea.Cmd {
 	}
 }
 
+func (m model) fetchSeasons(c discovery.Content) tea.Cmd {
+	return func() tea.Msg {
+		seasons, err := m.tmdb.TVSeasons(c.ID)
+		return seasonsLoadedMsg{contentID: c.ID, seasons: seasons, err: err}
+	}
+}
+
+func (m model) fetchTVEpisodes(c discovery.Content, season int) tea.Cmd {
+	return func() tea.Msg {
+		eps, err := m.tmdb.TVEpisodes(c.ID, season)
+		refs := make([]episodeRef, len(eps))
+		for i, e := range eps {
+			refs[i] = episodeRef{number: e.EpisodeNumber, label: fmt.Sprintf("%d. %s", e.EpisodeNumber, e.Name)}
+		}
+		return episodesLoadedMsg{contentID: c.ID, episodes: refs, err: err}
+	}
+}
+
+// animeEpisodes builds a numbered episode list from the anime's known
+// episode count — AniList doesn't reliably expose per-episode titles the
+// way TMDB does for TV, so this is deliberately just "Episode N".
+func animeEpisodes(c discovery.Content) []episodeRef {
+	n := c.Episodes
+	if n <= 0 {
+		n = 1 // unknown count: still offer episode 1 rather than a dead end
+	}
+	refs := make([]episodeRef, n)
+	for i := 0; i < n; i++ {
+		refs[i] = episodeRef{number: i + 1, label: fmt.Sprintf("Episode %d", i+1)}
+	}
+	return refs
+}
+
 // resolveAndPlay runs the configured provider for this content's Kind, then
-// hands the result to mpv. For anime, a dub request that fails automatically
-// retries once as sub before surfacing an error (IMPLEMENTATION_PLAN.md v1:
-// most sources don't have every title dubbed, so silently falling back is
-// better UX than a dead end).
-func resolveAndPlay(cfg *config.Config, c discovery.Content, subOrDub string) tea.Cmd {
+// hands the result to mpv, then records it to history on success. For
+// anime, a dub request that fails automatically retries once as sub
+// (IMPLEMENTATION_PLAN.md v1: most sources don't have every title dubbed).
+func resolveAndPlay(cfg *config.Config, hist *history.DB, c discovery.Content, subOrDub string, season, episode int) tea.Cmd {
 	return func() tea.Msg {
 		providers := providersFor(cfg, c.Kind)
 		if len(providers) == 0 {
@@ -229,7 +350,7 @@ func resolveAndPlay(cfg *config.Config, c discovery.Content, subOrDub string) te
 		}
 		providerExe := providers[0]
 
-		req := provider.ResolveRequest{Type: string(c.Kind), Title: c.Title, Year: yearInt(c.Year)}
+		req := provider.ResolveRequest{Type: string(c.Kind), Title: c.Title, Year: yearInt(c.Year), Season: season, Episode: episode}
 		if c.Kind == discovery.KindAnime {
 			req.SubOrDub = subOrDub
 		}
@@ -248,6 +369,10 @@ func resolveAndPlay(cfg *config.Config, c discovery.Content, subOrDub string) te
 
 		if err := player.Play(cfg.MPV.Path, res); err != nil {
 			return playFinishedMsg{err: fmt.Errorf("mpv: %w", err)}
+		}
+
+		if hist != nil {
+			_ = hist.MarkWatched(string(c.Kind), c.ID, c.Title, season, episode)
 		}
 		return playFinishedMsg{err: nil}
 	}
@@ -287,7 +412,10 @@ func (m model) selectedContent() (discovery.Content, bool) {
 }
 
 func (m *model) applyListLayout() {
-	m.list.SetSize(m.width-appMargin*2, m.height-headerRows-appMargin)
+	h := m.height - headerRows - appMargin
+	m.list.SetSize(m.width-appMargin*2, h)
+	m.seasonList.SetSize(m.width-appMargin*2, h)
+	m.episodeList.SetSize(m.width-appMargin*2, h)
 }
 
 func (m model) openDetail(c discovery.Content) (model, tea.Cmd) {
@@ -299,7 +427,6 @@ func (m model) openDetail(c discovery.Content) (model, tea.Cmd) {
 	return m, fetchPoster(c)
 }
 
-// switchTab clears any active search and reloads trending for the new tab.
 func (m model) switchTab(tab discovery.Kind) (model, tea.Cmd) {
 	m.tab = tab
 	m.typing = false
@@ -326,7 +453,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case trendingLoadedMsg:
 		if msg.tab != m.tab {
-			return m, nil // arrived after the user switched tabs again
+			return m, nil
 		}
 		m.loading = false
 		if msg.err != nil {
@@ -338,7 +465,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case searchResultsMsg:
 		if msg.tab != m.tab || msg.query != m.query {
-			return m, nil // stale: tab or query changed since this was fired
+			return m, nil
 		}
 		if msg.err != nil {
 			m.searchErr = msg.err
@@ -364,6 +491,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.posterErr = msg.err
 		return m, nil
 
+	case seasonsLoadedMsg:
+		if msg.contentID != m.selected.ID {
+			return m, nil
+		}
+		m.seasonsLoad = false
+		if msg.err != nil {
+			m.seasonsErr = msg.err
+			return m, nil
+		}
+		items := make([]list.Item, len(msg.seasons))
+		for i, s := range msg.seasons {
+			items[i] = seasonItem{s: s}
+		}
+		m.seasonList.SetItems(items)
+		return m, nil
+
+	case episodesLoadedMsg:
+		if msg.contentID != m.selected.ID {
+			return m, nil
+		}
+		m.episodesLoad = false
+		if msg.err != nil {
+			m.episodesErr = msg.err
+			return m, nil
+		}
+		items := make([]list.Item, len(msg.episodes))
+		for i, e := range msg.episodes {
+			items[i] = episodeItem{e: e}
+		}
+		m.episodeList.SetItems(items)
+		return m, nil
+
 	case playFinishedMsg:
 		m.playErr = msg.err
 		m.screen = screenDetail
@@ -378,106 +537,184 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.typing {
-		switch msg.String() {
-		case "esc":
-			m.typing = false
-			m.query = ""
-			m.searchInput.SetValue("")
-			m.searchInput.Blur()
-			m.searchErr = nil
-			m.list.Title = "Trending " + tabLabel(m.tab)
-			return m, m.fetchTrending(m.tab)
-		case "ctrl+c":
-			return m, tea.Quit
-		case "enter", "down":
-			m.typing = false
-			m.searchInput.Blur()
-			q := m.searchInput.Value()
-			if q == "" {
-				return m, nil
-			}
-			m.searchGen++
-			if q == m.query {
-				return m, nil
-			}
-			m.query = q
-			return m, m.fetchSearch(m.tab, q)
-		}
-
-		var cmd tea.Cmd
-		m.searchInput, cmd = m.searchInput.Update(msg)
-		m.searchGen++
-		return m, tea.Batch(cmd, scheduleDebounce(m.searchGen, m.searchInput.Value()))
+		return m.handleTypingKey(msg)
 	}
 
 	switch m.screen {
 	case screenDetail:
-		switch msg.String() {
-		case "esc", "backspace":
-			m.screen = screenBrowsing
-			m.playErr = nil
-			return m, nil
-		case "s":
-			if m.selected.Kind == discovery.KindAnime {
-				if m.subOrDub == "sub" {
-					m.subOrDub = "dub"
-				} else {
-					m.subOrDub = "sub"
-				}
-			}
-			return m, nil
-		case "enter", "p":
-			if !m.mpvFound {
-				m.playErr = fmt.Errorf("mpv not on PATH, can't play")
-				return m, nil
-			}
-			m.screen = screenResolving
-			m.playErr = nil
-			return m, resolveAndPlay(m.cfg, m.selected, m.subOrDub)
-		case "q", "ctrl+c":
-			return m, tea.Quit
-		}
-		return m, nil
-
+		return m.handleDetailKey(msg)
+	case screenSeasonPicker:
+		return m.handleSeasonPickerKey(msg)
+	case screenEpisodePicker:
+		return m.handleEpisodePickerKey(msg)
 	case screenResolving:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
 		return m, nil
+	default:
+		return m.handleBrowsingKey(msg)
+	}
+}
 
-	default: // screenBrowsing
-		switch msg.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-		case "/":
-			m.typing = true
-			m.searchInput.Focus()
-			return m, textinput.Blink
-		case "esc":
-			if m.query != "" {
-				m.query = ""
-				m.searchInput.SetValue("")
-				m.list.Title = "Trending " + tabLabel(m.tab)
-				m.searchErr = nil
-				return m, m.fetchTrending(m.tab)
-			}
+func (m model) handleTypingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.typing = false
+		m.query = ""
+		m.searchInput.SetValue("")
+		m.searchInput.Blur()
+		m.searchErr = nil
+		m.list.Title = "Trending " + tabLabel(m.tab)
+		return m, m.fetchTrending(m.tab)
+	case "ctrl+c":
+		return m, tea.Quit
+	case "enter", "down":
+		m.typing = false
+		m.searchInput.Blur()
+		q := m.searchInput.Value()
+		if q == "" {
 			return m, nil
-		case "enter":
-			if c, ok := m.selectedContent(); ok {
-				return m.openDetail(c)
-			}
-			return m, nil
-		case "left", "h":
-			return m.switchTab(prevTab(m.tab))
-		case "right", "l":
-			return m.switchTab(nextTab(m.tab))
-		case "tab":
-			return m.switchTab(nextTab(m.tab))
 		}
+		m.searchGen++
+		if q == m.query {
+			return m, nil
+		}
+		m.query = q
+		return m, m.fetchSearch(m.tab, q)
+	}
+
+	var cmd tea.Cmd
+	m.searchInput, cmd = m.searchInput.Update(msg)
+	m.searchGen++
+	return m, tea.Batch(cmd, scheduleDebounce(m.searchGen, m.searchInput.Value()))
+}
+
+func (m model) handleBrowsingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "/":
+		m.typing = true
+		m.searchInput.Focus()
+		return m, textinput.Blink
+	case "esc":
+		if m.query != "" {
+			m.query = ""
+			m.searchInput.SetValue("")
+			m.list.Title = "Trending " + tabLabel(m.tab)
+			m.searchErr = nil
+			return m, m.fetchTrending(m.tab)
+		}
+		return m, nil
+	case "enter":
+		if c, ok := m.selectedContent(); ok {
+			return m.openDetail(c)
+		}
+		return m, nil
+	case "left", "h":
+		return m.switchTab(prevTab(m.tab))
+	case "right", "l", "tab":
+		return m.switchTab(nextTab(m.tab))
 	}
 
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
+	return m, cmd
+}
+
+func (m model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "backspace":
+		m.screen = screenBrowsing
+		m.playErr = nil
+		return m, nil
+	case "s":
+		if m.selected.Kind == discovery.KindAnime {
+			if m.subOrDub == "sub" {
+				m.subOrDub = "dub"
+			} else {
+				m.subOrDub = "sub"
+			}
+		}
+		return m, nil
+	case "enter", "p":
+		if !m.mpvFound {
+			m.playErr = fmt.Errorf("mpv not on PATH, can't play")
+			return m, nil
+		}
+		m.playErr = nil
+		switch m.selected.Kind {
+		case discovery.KindMovie:
+			m.screen = screenResolving
+			return m, resolveAndPlay(m.cfg, m.history, m.selected, m.subOrDub, 0, 0)
+		case discovery.KindTV:
+			m.screen = screenSeasonPicker
+			m.seasonsLoad = true
+			m.seasonsErr = nil
+			m.seasonList.SetItems(nil)
+			return m, m.fetchSeasons(m.selected)
+		default: // anime
+			m.screen = screenEpisodePicker
+			m.selectedSeason = discovery.TVSeason{}
+			items := make([]list.Item, 0)
+			for _, e := range animeEpisodes(m.selected) {
+				items = append(items, episodeItem{e: e})
+			}
+			m.episodeList.SetItems(items)
+			return m, nil
+		}
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m model) handleSeasonPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "backspace":
+		m.screen = screenDetail
+		return m, nil
+	case "enter":
+		item, ok := m.seasonList.SelectedItem().(seasonItem)
+		if !ok {
+			return m, nil
+		}
+		m.selectedSeason = item.s
+		m.screen = screenEpisodePicker
+		m.episodesLoad = true
+		m.episodesErr = nil
+		m.episodeList.SetItems(nil)
+		return m, m.fetchTVEpisodes(m.selected, item.s.SeasonNumber)
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	}
+	var cmd tea.Cmd
+	m.seasonList, cmd = m.seasonList.Update(msg)
+	return m, cmd
+}
+
+func (m model) handleEpisodePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "backspace":
+		if m.selected.Kind == discovery.KindTV {
+			m.screen = screenSeasonPicker
+		} else {
+			m.screen = screenDetail
+		}
+		return m, nil
+	case "enter":
+		item, ok := m.episodeList.SelectedItem().(episodeItem)
+		if !ok {
+			return m, nil
+		}
+		m.screen = screenResolving
+		return m, resolveAndPlay(m.cfg, m.history, m.selected, m.subOrDub, m.selectedSeason.SeasonNumber, item.e.number)
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	}
+	var cmd tea.Cmd
+	m.episodeList, cmd = m.episodeList.Update(msg)
 	return m, cmd
 }
 
@@ -500,15 +737,15 @@ func nextTab(t discovery.Kind) discovery.Kind {
 }
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	okStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	warnStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
-	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	helpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Align(lipgloss.Right)
-	appStyle      = lipgloss.NewStyle().Padding(1, appMargin)
-	posterColumn  = lipgloss.NewStyle().Width(posterMaxWidthPx/8 + 2)
-	ratingStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	okStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	warnStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
+	errStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	dimStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	helpStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Align(lipgloss.Right)
+	appStyle         = lipgloss.NewStyle().Padding(1, appMargin)
+	posterColumn     = lipgloss.NewStyle().Width(posterMaxWidthPx/8 + 2)
+	ratingStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 	activeTabStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Underline(true)
 	inactiveTabStyle = dimStyle
 )
@@ -523,6 +760,8 @@ func (m model) helpFor() string {
 		if m.selected.Kind == discovery.KindAnime {
 			lines = append([]string{"s: sub/dub"}, lines...)
 		}
+	case m.screen == screenSeasonPicker || m.screen == screenEpisodePicker:
+		lines = []string{"↑/↓ navigate", "enter: select", "esc: back", "q: quit"}
 	case m.screen == screenResolving:
 		lines = []string{"please wait…"}
 	default:
@@ -569,10 +808,11 @@ func (m model) header() string {
 		} else if m.query != "" {
 			searchLine = dimStyle.Render("/ " + m.query + "  (esc to clear)")
 		}
-		searchLine += "\n"
+	} else {
+		searchLine = dimStyle.Render(m.selected.Title)
 	}
 
-	return titleLine + "\n\n" + tabs + searchLine + "\n"
+	return titleLine + "\n\n" + tabs + searchLine + "\n\n"
 }
 
 func (m model) View() string {
@@ -580,12 +820,26 @@ func (m model) View() string {
 	switch m.screen {
 	case screenDetail:
 		content = m.header() + m.detailView()
+	case screenSeasonPicker:
+		content = m.header() + m.pickerView(m.seasonsLoad, m.seasonsErr, m.seasonList)
+	case screenEpisodePicker:
+		content = m.header() + m.pickerView(m.episodesLoad, m.episodesErr, m.episodeList)
 	case screenResolving:
 		content = m.header() + "resolving \"" + m.selected.Title + "\"…\n\n" + dimStyle.Render("this may take a few seconds")
 	default:
 		content = m.header() + m.browsingView()
 	}
 	return appStyle.Render(content)
+}
+
+func (m model) pickerView(loading bool, err error, l list.Model) string {
+	if loading {
+		return dimStyle.Render("loading…")
+	}
+	if err != nil {
+		return errStyle.Render("failed to load: " + err.Error())
+	}
+	return l.View()
 }
 
 func (m model) browsingView() string {
@@ -636,7 +890,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(cfg), tea.WithAltScreen())
+	hist, err := history.Open()
+	if err != nil {
+		// Non-fatal: history/continue-watching just won't work this run.
+		fmt.Fprintln(os.Stderr, "warning: history.db unavailable:", err)
+		hist = nil
+	} else {
+		defer hist.Close()
+	}
+
+	p := tea.NewProgram(initialModel(cfg, hist), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

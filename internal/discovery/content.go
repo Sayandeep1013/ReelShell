@@ -27,6 +27,17 @@ type Content struct {
 	// Exactly one of these is set, matching Kind — see poster.FetchContent.
 	TMDBPosterPath string
 	AniListPosterURL string
+
+	// Episodes is anime's total episode count (0 if unknown). TV shows
+	// use TMDBClient.TVSeasons/TVEpisodes instead, since they have a real
+	// season structure AniList doesn't expose the same way.
+	Episodes int
+
+	// Continued marks a synthetic Content built from history.Entry for the
+	// "continue watching" row rather than a real discovery-API result —
+	// it only carries Kind/ID/Title, no rating/overview/poster (a known
+	// v1 limitation: these aren't re-fetched from the source API).
+	Continued bool
 }
 
 func FromMovie(m Movie) Content {
@@ -47,5 +58,6 @@ func FromAnime(a Anime) Content {
 	return Content{
 		Kind: KindAnime, ID: a.ID, Title: a.Title, Overview: a.Overview,
 		Rating: a.Rating, Year: a.Year, AniListPosterURL: a.PosterURL,
+		Episodes: a.Episodes,
 	}
 }

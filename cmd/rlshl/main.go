@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -174,6 +175,13 @@ type model struct {
 	posterErr   error
 	playErr     error
 
+	// preferredProvider: which provider to try first per content Kind,
+	// cycled with 'n' on the detail screen (v2 provider toggle design).
+	// Session-only, not persisted to config.toml. The rest of the
+	// configured providers for that Kind still act as automatic fallback
+	// underneath, in their original order.
+	preferredProvider map[discovery.Kind]int
+
 	seasonList    list.Model
 	seasonsErr    error
 	seasonsLoad   bool
@@ -215,19 +223,20 @@ func initialModel(cfg *config.Config, hist *history.DB) model {
 	ti.Prompt = "/ "
 
 	return model{
-		cfg:         cfg,
-		tmdb:        discovery.NewTMDBClient(cfg.TMDB.APIKey),
-		anilist:     discovery.NewAniListClient(),
-		history:     hist,
-		dcache:      cache.New(discoveryCacheTTL),
-		mpvFound:    player.CheckAvailable(cfg.MPV.Path),
-		tab:         discovery.KindMovie,
-		loading:     true,
-		list:        l,
-		seasonList:  seasons,
-		episodeList: episodes,
-		searchInput: ti,
-		screen:      screenBrowsing,
+		cfg:               cfg,
+		tmdb:              discovery.NewTMDBClient(cfg.TMDB.APIKey),
+		anilist:           discovery.NewAniListClient(),
+		history:           hist,
+		dcache:            cache.New(discoveryCacheTTL),
+		mpvFound:          player.CheckAvailable(cfg.MPV.Path),
+		tab:               discovery.KindMovie,
+		loading:           true,
+		list:              l,
+		seasonList:        seasons,
+		episodeList:       episodes,
+		searchInput:       ti,
+		screen:            screenBrowsing,
+		preferredProvider: make(map[discovery.Kind]int),
 	}
 }
 
@@ -366,15 +375,17 @@ func animeEpisodes(c discovery.Content) []episodeRef {
 	return refs
 }
 
-// resolveAndPlay tries every configured provider for this content's Kind in
-// order, stopping at the first success (SPEC.md v2: multi-provider
-// fallback). For anime, a dub request that fails is retried once as sub on
-// that same provider before moving to the next provider in the chain
+// resolveAndPlay tries providers for this content's Kind starting from
+// preferredIdx (the user's manually-cycled preference, 'n' on the detail
+// screen), wrapping around through the rest in their configured order,
+// stopping at the first success (SPEC.md v2: multi-provider fallback +
+// preferred-provider toggle). For anime, a dub request that fails is
+// retried once as sub on that same provider before moving to the next
 // (IMPLEMENTATION_PLAN.md v1: most sources don't have every title dubbed).
 // On success, hands the result to mpv and records it to history.
-func resolveAndPlay(cfg *config.Config, hist *history.DB, c discovery.Content, subOrDub string, season, episode int) tea.Cmd {
+func resolveAndPlay(cfg *config.Config, hist *history.DB, c discovery.Content, subOrDub string, season, episode, preferredIdx int) tea.Cmd {
 	return func() tea.Msg {
-		providers := providersFor(cfg, c.Kind)
+		providers := orderedProviders(providersFor(cfg, c.Kind), preferredIdx)
 		if len(providers) == 0 {
 			return playFinishedMsg{err: fmt.Errorf("no %s provider configured", c.Kind)}
 		}
@@ -424,6 +435,23 @@ func providersFor(cfg *config.Config, k discovery.Kind) []string {
 	default:
 		return cfg.Providers.Anime
 	}
+}
+
+// orderedProviders rotates providers so index idx comes first, preserving
+// the relative order of the rest — the preferred one is tried first, and
+// everything else still acts as fallback underneath, in its original order.
+func orderedProviders(providers []string, idx int) []string {
+	if len(providers) == 0 {
+		return providers
+	}
+	idx = idx % len(providers)
+	return append(append([]string{}, providers[idx:]...), providers[:idx]...)
+}
+
+// providerName returns a short display name for a provider's executable
+// path — just the filename, not the full G:\ReelShell\providers\... path.
+func providerName(path string) string {
+	return filepath.Base(path)
 }
 
 func yearInt(dateStr string) int {
@@ -701,6 +729,12 @@ func (m model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case "n":
+		providers := providersFor(m.cfg, m.selected.Kind)
+		if len(providers) > 1 {
+			m.preferredProvider[m.selected.Kind] = (m.preferredProvider[m.selected.Kind] + 1) % len(providers)
+		}
+		return m, nil
 	case "enter", "p":
 		if !m.mpvFound {
 			m.playErr = fmt.Errorf("mpv not on PATH, can't play")
@@ -710,7 +744,7 @@ func (m model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.selected.Kind {
 		case discovery.KindMovie:
 			m.screen = screenResolving
-			return m, resolveAndPlay(m.cfg, m.history, m.selected, m.subOrDub, 0, 0)
+			return m, resolveAndPlay(m.cfg, m.history, m.selected, m.subOrDub, 0, 0, m.preferredProvider[m.selected.Kind])
 		case discovery.KindTV:
 			m.screen = screenSeasonPicker
 			m.seasonsLoad = true
@@ -772,7 +806,7 @@ func (m model) handleEpisodePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.screen = screenResolving
-		return m, resolveAndPlay(m.cfg, m.history, m.selected, m.subOrDub, m.selectedSeason.SeasonNumber, item.e.number)
+		return m, resolveAndPlay(m.cfg, m.history, m.selected, m.subOrDub, m.selectedSeason.SeasonNumber, item.e.number, m.preferredProvider[m.selected.Kind])
 	case "q", "ctrl+c":
 		return m, tea.Quit
 	}
@@ -820,6 +854,9 @@ func (m model) helpFor() string {
 		lines = []string{"enter/↓: browse results", "esc: cancel"}
 	case m.screen == screenDetail:
 		lines = []string{"enter/p: play", "esc: back", "q: quit"}
+		if len(providersFor(m.cfg, m.selected.Kind)) > 1 {
+			lines = append([]string{"n: next provider"}, lines...)
+		}
 		if m.selected.Kind == discovery.KindAnime {
 			lines = append([]string{"s: sub/dub"}, lines...)
 		}
@@ -938,6 +975,11 @@ func (m model) detailView() string {
 		infoBlock += dimStyle.Render("  [" + strings.ToUpper(m.subOrDub) + "]")
 	}
 	infoBlock += "\n\n" + info.Render(m.selected.Overview)
+
+	if providers := providersFor(m.cfg, m.selected.Kind); len(providers) > 1 {
+		idx := m.preferredProvider[m.selected.Kind] % len(providers)
+		infoBlock += "\n\n" + dimStyle.Render(fmt.Sprintf("provider: %s (%d/%d)", providerName(providers[idx]), idx+1, len(providers)))
+	}
 
 	if m.playErr != nil {
 		infoBlock += "\n\n" + errStyle.Render("play failed: "+m.playErr.Error())

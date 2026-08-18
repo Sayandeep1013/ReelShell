@@ -83,7 +83,10 @@ func defaultConfig() *Config {
 		TMDB:    TMDBConfig{APIKey: ""},
 		MPV:     MPVConfig{Path: ""},
 		Providers: ProvidersConfig{
-			Movie: []string{filepath.Join(DataDir, "providers", "movie-provider.exe")},
+			Movie: []string{
+				filepath.Join(DataDir, "providers", "movie-provider.exe"),
+				filepath.Join(DataDir, "providers", "movie-provider-2.exe"),
+			},
 			TV:    []string{filepath.Join(DataDir, "providers", "tv-provider.exe")},
 			Anime: []string{filepath.Join(DataDir, "providers", "anime-nyaa.exe")},
 		},

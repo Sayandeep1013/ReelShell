@@ -21,7 +21,7 @@ func TestResolveAndPlayDummyProvider(t *testing.T) {
 	}
 
 	content := discovery.FromMovie(discovery.Movie{Title: "Integration Test Movie", Year: "2020-01-01"})
-	cmd := resolveAndPlay(cfg, nil, content, "", 0, 0)
+	cmd := resolveAndPlay(cfg, nil, content, "", 0, 0, 0)
 	msg := cmd()
 
 	result, ok := msg.(playFinishedMsg)
@@ -30,5 +30,31 @@ func TestResolveAndPlayDummyProvider(t *testing.T) {
 	}
 	if result.err != nil {
 		t.Fatalf("resolveAndPlay failed: %v", result.err)
+	}
+}
+
+func TestOrderedProvidersRotation(t *testing.T) {
+	providers := []string{"a", "b", "c"}
+
+	cases := []struct {
+		idx  int
+		want []string
+	}{
+		{0, []string{"a", "b", "c"}},
+		{1, []string{"b", "c", "a"}},
+		{2, []string{"c", "a", "b"}},
+		{3, []string{"a", "b", "c"}}, // wraps via modulo
+	}
+
+	for _, tc := range cases {
+		got := orderedProviders(providers, tc.idx)
+		if len(got) != len(tc.want) {
+			t.Fatalf("idx %d: expected %v, got %v", tc.idx, tc.want, got)
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Fatalf("idx %d: expected %v, got %v", tc.idx, tc.want, got)
+			}
+		}
 	}
 }

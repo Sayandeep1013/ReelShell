@@ -522,7 +522,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(cfg))
+	p := tea.NewProgram(initialModel(cfg), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

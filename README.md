@@ -16,4 +16,6 @@ This repo is the public framework only — the TUI, discovery-layer clients (TMD
 
 ## Status
 
-**v0 and v1 complete.** Movies/TV/Anime tabs (TMDB + AniList), search, season/episode picker, sub/dub toggle with auto-fallback, watch history + continue-watching, and full resolve→mpv playback all verified end to end. Playback still goes through a dummy provider that always returns a public-domain test clip — a real provider (private repo) is the next real gap, alongside v2 (fuzzy search, caching, multi-provider fallback, torrent provider example).
+**v0, v1, and v2 (framework parts) complete.** Movies/TV/Anime tabs (TMDB + AniList), search with instant local fuzzy filtering + debounced remote refinement, response caching, season/episode picker, sub/dub toggle with auto-fallback, multi-provider fallback chains, multi-language subtitle support, watch history + continue-watching, and full resolve→mpv playback all verified end to end.
+
+Deliberately not built yet: the Nyaa/torrent provider example from v2, and any real source-resolution provider — both are real-provider work, on hold pending research into an actual source (private repo, not this one). Playback currently goes through a dummy provider that always returns a public-domain test clip.

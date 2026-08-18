@@ -14,11 +14,12 @@ import (
 const tmdbBaseURL = "https://api.themoviedb.org/3"
 
 type Movie struct {
-	ID       int     `json:"id"`
-	Title    string  `json:"title"`
-	Overview string  `json:"overview"`
-	Rating   float64 `json:"vote_average"`
-	Year     string  `json:"release_date"` // YYYY-MM-DD, truncated for display by callers
+	ID         int     `json:"id"`
+	Title      string  `json:"title"`
+	Overview   string  `json:"overview"`
+	Rating     float64 `json:"vote_average"`
+	Year       string  `json:"release_date"` // YYYY-MM-DD, truncated for display by callers
+	PosterPath string  `json:"poster_path"`
 }
 
 type tmdbMovieList struct {

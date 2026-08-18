@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -16,6 +17,7 @@ import (
 	"github.com/Sayandeep1013/ReelShell/internal/config"
 	"github.com/Sayandeep1013/ReelShell/internal/discovery"
 	"github.com/Sayandeep1013/ReelShell/internal/player"
+	"github.com/Sayandeep1013/ReelShell/internal/poster"
 	"github.com/Sayandeep1013/ReelShell/internal/provider"
 )
 
@@ -28,6 +30,8 @@ const searchDebounce = 350 * time.Millisecond
 // it's treated as failed (IMPLEMENTATION_PLAN.md, v0 error table: a hung
 // provider must not freeze the UI).
 const resolveTimeout = 15 * time.Second
+
+const posterMaxWidthPx = 160
 
 type screen int
 
@@ -56,6 +60,15 @@ func (i movieItem) Description() string {
 
 func (i movieItem) FilterValue() string { return i.movie.Title }
 
+// navKeys are the only keys forwarded to the list while a search box is
+// focused — everything else (including letters like j/k, which would
+// otherwise collide with typing a title) goes to the text input instead.
+// This is the fix for "typed a search, then couldn't navigate results."
+var navKeys = map[string]bool{
+	"up": true, "down": true, "pgup": true, "pgdown": true,
+	"home": true, "end": true,
+}
+
 type trendingLoadedMsg struct {
 	movies []discovery.Movie
 	err    error
@@ -79,6 +92,12 @@ type playFinishedMsg struct {
 	err error
 }
 
+type posterLoadedMsg struct {
+	movieID int
+	sixel   string
+	err     error
+}
+
 type model struct {
 	cfg      *config.Config
 	tmdb     *discovery.TMDBClient
@@ -86,23 +105,33 @@ type model struct {
 	loading  bool
 	loadErr  error
 	list     list.Model
+	width    int
 
 	searching   bool
 	searchInput textinput.Model
 	searchGen   int
 	searchErr   error
 
-	screen      screen
-	selected    discovery.Movie
-	resolveErr  error
-	playErr     error
+	screen       screen
+	selected     discovery.Movie
+	posterSixel  string
+	posterErr    error
+	playErr      error
+}
+
+func compactDelegate() list.DefaultDelegate {
+	d := list.NewDefaultDelegate()
+	d.SetSpacing(0)
+	d.ShowDescription = true
+	return d
 }
 
 func initialModel(cfg *config.Config) model {
-	l := list.New(nil, list.NewDefaultDelegate(), 0, 0)
+	l := list.New(nil, compactDelegate(), 0, 0)
 	l.Title = "Trending Movies"
 	l.SetShowStatusBar(false)
 	l.SetShowFilter(false) // we drive search ourselves against TMDB, not the built-in local filter
+	l.SetShowHelp(false)   // replaced by our own persistent help panel
 
 	ti := textinput.New()
 	ti.Placeholder = "search movies…"
@@ -137,6 +166,13 @@ func scheduleDebounce(gen int, query string) tea.Cmd {
 	return tea.Tick(searchDebounce, func(time.Time) tea.Msg {
 		return debounceFireMsg{gen: gen, query: query}
 	})
+}
+
+func fetchPoster(movie discovery.Movie) tea.Cmd {
+	return func() tea.Msg {
+		sixel, err := poster.Fetch(movie.PosterPath, posterMaxWidthPx)
+		return posterLoadedMsg{movieID: movie.ID, sixel: sixel, err: err}
+	}
 }
 
 // resolveAndPlay runs the configured movie provider, then hands the result
@@ -186,6 +222,7 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		m.width = msg.Width
 		m.list.SetSize(msg.Width, msg.Height-6)
 		return m, nil
 
@@ -217,6 +254,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, fetchSearch(m.tmdb, msg.query)
 
+	case posterLoadedMsg:
+		if msg.movieID != m.selected.ID {
+			return m, nil // arrived after the user moved on to a different title
+		}
+		m.posterSixel = msg.sixel
+		m.posterErr = msg.err
+		return m, nil
+
 	case playFinishedMsg:
 		m.playErr = msg.err
 		m.screen = screenDetail
@@ -243,6 +288,21 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, fetchTrending(m.tmdb)
 		case "ctrl+c":
 			return m, tea.Quit
+		case "enter":
+			if item, ok := m.list.SelectedItem().(movieItem); ok {
+				m.selected = item.movie
+				m.posterSixel = ""
+				m.posterErr = nil
+				m.screen = screenDetail
+				return m, fetchPoster(item.movie)
+			}
+			return m, nil
+		}
+
+		if navKeys[msg.String()] {
+			var cmd tea.Cmd
+			m.list, cmd = m.list.Update(msg)
+			return m, cmd
 		}
 
 		var cmd tea.Cmd
@@ -288,7 +348,10 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if item, ok := m.list.SelectedItem().(movieItem); ok {
 				m.selected = item.movie
+				m.posterSixel = ""
+				m.posterErr = nil
 				m.screen = screenDetail
+				return m, fetchPoster(item.movie)
 			}
 			return m, nil
 		}
@@ -305,14 +368,46 @@ var (
 	warnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
 	errStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	helpStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Align(lipgloss.Right)
 )
 
-func (m model) View() string {
+// helpFor returns the persistent keybinding cheat-sheet for the current
+// screen — shown top-right so nothing needs to be memorized.
+func (m model) helpFor() string {
+	var lines []string
+	switch {
+	case m.searching:
+		lines = []string{"↑/↓ navigate results", "enter: details", "esc: cancel search"}
+	case m.screen == screenDetail:
+		lines = []string{"enter/p: play", "esc: back", "q: quit"}
+	case m.screen == screenResolving:
+		lines = []string{"please wait…"}
+	default:
+		lines = []string{"↑/↓ navigate", "enter: details", "/ search", "q: quit"}
+	}
+	return helpStyle.Render(strings.Join(lines, "\n"))
+}
+
+func (m model) header() string {
 	status := okStyle.Render("mpv: found")
 	if !m.mpvFound {
-		status = warnStyle.Render("mpv: NOT on PATH — install it before playback will work")
+		status = warnStyle.Render("mpv: NOT on PATH")
 	}
-	header := titleStyle.Render("ReelShell") + "  " + status + "\n\n"
+	left := titleStyle.Render("ReelShell") + "  " + status
+	help := m.helpFor()
+
+	if m.width <= 0 {
+		return left + "\n" + help + "\n"
+	}
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(help)
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + help + "\n"
+}
+
+func (m model) View() string {
+	header := m.header() + "\n"
 
 	switch m.screen {
 	case screenDetail:
@@ -334,21 +429,20 @@ func (m model) View() string {
 		header += errStyle.Render("search failed: "+m.searchErr.Error()) + "\n\n"
 	}
 
-	footer := dimStyle.Render("enter: details • / search • q quit")
-	if m.searching {
-		footer = dimStyle.Render("esc to cancel search")
-	}
-	return header + m.list.View() + "\n" + footer + "\n"
+	return header + m.list.View() + "\n"
 }
 
 func (m model) detailView() string {
-	body := titleStyle.Render(m.selected.Title) + "\n"
+	body := ""
+	if m.posterSixel != "" {
+		body += m.posterSixel + "\n"
+	}
+	body += titleStyle.Render(m.selected.Title) + "\n"
 	body += fmt.Sprintf("★ %.1f\n\n", m.selected.Rating)
 	body += m.selected.Overview + "\n\n"
 	if m.playErr != nil {
 		body += errStyle.Render("play failed: "+m.playErr.Error()) + "\n\n"
 	}
-	body += dimStyle.Render("enter/p: play • esc: back • q: quit")
 	return body
 }
 

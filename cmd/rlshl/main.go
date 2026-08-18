@@ -26,21 +26,23 @@ import (
 // avoids hitting TMDB's rate limit on every keystroke).
 const searchDebounce = 350 * time.Millisecond
 
-// previewDebounce is the same idea applied to the live poster preview pane:
-// don't fetch+decode+resize+sixel-encode an image on every single row while
-// the user is holding down arrow keys scrolling fast — wait for the cursor
-// to settle first.
-const previewDebounce = 150 * time.Millisecond
-
 // resolveTimeout bounds how long a provider gets to resolve a stream before
 // it's treated as failed (IMPLEMENTATION_PLAN.md, v0 error table: a hung
 // provider must not freeze the UI).
 const resolveTimeout = 15 * time.Second
 
+const posterMaxWidthPx = 180
+
+// Fixed layout regions, in terminal rows, so switching screens or entering
+// search never shifts anything else on screen:
+//   row 0    : title + mpv status + contextual help
+//   row 1    : blank
+//   row 2    : search line (always reserved, even when empty)
+//   row 3    : blank
+//   row 4... : content (list, or detail screen)
 const (
-	detailPosterMaxWidthPx  = 160
-	previewPosterMaxWidthPx = 120
-	previewPaneWidth        = 30 // columns reserved for the preview pane
+	headerRows = 4
+	appMargin  = 2 // horizontal padding so nothing sits flush against the terminal edge
 )
 
 type screen int
@@ -69,14 +71,6 @@ func (i movieItem) Description() string {
 }
 
 func (i movieItem) FilterValue() string { return i.movie.Title }
-
-// navKeys are the only keys forwarded to the list while a search box is
-// focused — everything else (including letters like j/k, which would
-// otherwise collide with typing a title) goes to the text input instead.
-var navKeys = map[string]bool{
-	"up": true, "down": true, "pgup": true, "pgdown": true,
-	"home": true, "end": true,
-}
 
 type trendingLoadedMsg struct {
 	movies []discovery.Movie
@@ -107,18 +101,6 @@ type posterLoadedMsg struct {
 	err     error
 }
 
-// previewDebounceMsg is the preview-pane equivalent of debounceFireMsg.
-type previewDebounceMsg struct {
-	gen   int
-	movie discovery.Movie
-}
-
-type previewLoadedMsg struct {
-	movieID int
-	sixel   string
-	err     error
-}
-
 type model struct {
 	cfg      *config.Config
 	tmdb     *discovery.TMDBClient
@@ -129,15 +111,17 @@ type model struct {
 	width    int
 	height   int
 
-	searching   bool
+	// Search has exactly two states: typing (composing a query, textinput
+	// owns the keyboard) and not-typing (the list owns the keyboard,
+	// exactly like plain browsing — no key ever has to be special-cased
+	// between the two, which was the source of the earlier navigation
+	// hassle). query persists as a label after typing ends, so results
+	// stay labeled even once focus has moved to the list.
+	typing      bool
 	searchInput textinput.Model
+	query       string
 	searchGen   int
 	searchErr   error
-
-	previewSixel  string
-	previewErr    error
-	previewGen    int
-	previewMovie  discovery.Movie
 
 	screen      screen
 	selected    discovery.Movie
@@ -197,21 +181,8 @@ func scheduleDebounce(gen int, query string) tea.Cmd {
 
 func fetchPoster(movie discovery.Movie) tea.Cmd {
 	return func() tea.Msg {
-		sixel, err := poster.Fetch(movie.PosterPath, detailPosterMaxWidthPx)
+		sixel, err := poster.Fetch(movie.PosterPath, posterMaxWidthPx)
 		return posterLoadedMsg{movieID: movie.ID, sixel: sixel, err: err}
-	}
-}
-
-func schedulePreviewDebounce(gen int, movie discovery.Movie) tea.Cmd {
-	return tea.Tick(previewDebounce, func(time.Time) tea.Msg {
-		return previewDebounceMsg{gen: gen, movie: movie}
-	})
-}
-
-func fetchPreviewPoster(movie discovery.Movie) tea.Cmd {
-	return func() tea.Msg {
-		sixel, err := poster.Fetch(movie.PosterPath, previewPosterMaxWidthPx)
-		return previewLoadedMsg{movieID: movie.ID, sixel: sixel, err: err}
 	}
 }
 
@@ -255,7 +226,6 @@ func setMovieItems(l *list.Model, movies []discovery.Movie) {
 	l.SetItems(items)
 }
 
-// selectedMovie returns the movie currently highlighted in the list, if any.
 func (m model) selectedMovie() (discovery.Movie, bool) {
 	item, ok := m.list.SelectedItem().(movieItem)
 	if !ok {
@@ -264,14 +234,16 @@ func (m model) selectedMovie() (discovery.Movie, bool) {
 	return item.movie, true
 }
 
-// applyListLayout recomputes the list's size given the current terminal
-// dimensions, accounting for the reserved preview-pane column.
 func (m *model) applyListLayout() {
-	listWidth := m.width - previewPaneWidth - 2
-	if listWidth < 10 {
-		listWidth = m.width
-	}
-	m.list.SetSize(listWidth, m.height-7)
+	m.list.SetSize(m.width-appMargin*2, m.height-headerRows-appMargin)
+}
+
+func (m model) openDetail(movie discovery.Movie) (model, tea.Cmd) {
+	m.selected = movie
+	m.posterSixel = ""
+	m.posterErr = nil
+	m.screen = screenDetail
+	return m, fetchPoster(movie)
 }
 
 func (m model) Init() tea.Cmd {
@@ -293,10 +265,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		setMovieItems(&m.list, msg.movies)
-		return m.triggerPreviewForSelection()
+		return m, nil
 
 	case searchResultsMsg:
-		if msg.query != m.searchInput.Value() {
+		if msg.query != m.query {
 			return m, nil // stale result from an earlier query, drop it
 		}
 		if msg.err != nil {
@@ -304,29 +276,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.searchErr = nil
-		m.list.Title = "Search: " + msg.query
+		m.list.Title = "Search results"
 		setMovieItems(&m.list, msg.movies)
-		return m.triggerPreviewForSelection()
+		return m, nil
 
 	case debounceFireMsg:
 		if msg.gen != m.searchGen || msg.query == "" {
 			return m, nil // superseded by a newer keystroke, or empty query
 		}
+		m.query = msg.query
 		return m, fetchSearch(m.tmdb, msg.query)
-
-	case previewDebounceMsg:
-		if msg.gen != m.previewGen {
-			return m, nil // superseded by further cursor movement, drop it
-		}
-		return m, fetchPreviewPoster(msg.movie)
-
-	case previewLoadedMsg:
-		if msg.movieID != m.previewMovie.ID {
-			return m, nil // arrived after the selection moved on
-		}
-		m.previewSixel = msg.sixel
-		m.previewErr = msg.err
-		return m, nil
 
 	case posterLoadedMsg:
 		if msg.movieID != m.selected.ID {
@@ -348,59 +307,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// triggerPreviewForSelection kicks off (debounced) a poster fetch for
-// whatever is currently highlighted — used both after fresh data loads and
-// after cursor movement.
-func (m model) triggerPreviewForSelection() (tea.Model, tea.Cmd) {
-	movie, ok := m.selectedMovie()
-	if !ok {
-		return m, nil
-	}
-	m.previewGen++
-	m.previewMovie = movie
-	return m, schedulePreviewDebounce(m.previewGen, movie)
-}
-
-// updateListNav forwards msg to the list, and if the cursor actually moved,
-// schedules a debounced preview-poster fetch for the newly selected item.
-func (m model) updateListNav(msg tea.Msg) (model, tea.Cmd) {
-	oldIdx := m.list.Index()
-	var listCmd tea.Cmd
-	m.list, listCmd = m.list.Update(msg)
-
-	if m.list.Index() == oldIdx {
-		return m, listCmd
-	}
-	newModel, previewCmd := m.triggerPreviewForSelection()
-	m = newModel.(model)
-	return m, tea.Batch(listCmd, previewCmd)
-}
-
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.searching {
+	if m.typing {
 		switch msg.String() {
 		case "esc":
-			m.searching = false
-			m.searchInput.Blur()
+			m.typing = false
+			m.query = ""
 			m.searchInput.SetValue("")
+			m.searchInput.Blur()
 			m.list.Title = "Trending Movies"
 			m.searchErr = nil
 			return m, fetchTrending(m.tmdb)
 		case "ctrl+c":
 			return m, tea.Quit
-		case "enter":
-			if movie, ok := m.selectedMovie(); ok {
-				m.selected = movie
-				m.posterSixel = ""
-				m.posterErr = nil
-				m.screen = screenDetail
-				return m, fetchPoster(movie)
+		case "enter", "down":
+			// Commit: hand keyboard focus to the list. If results for the
+			// current input haven't arrived yet, fire an immediate (non-
+			// debounced) search rather than making the user wait out the
+			// debounce window after explicitly asking to move on.
+			m.typing = false
+			m.searchInput.Blur()
+			q := m.searchInput.Value()
+			if q == "" {
+				return m, nil
 			}
-			return m, nil
-		}
-
-		if navKeys[msg.String()] {
-			return m.updateListNav(msg)
+			m.searchGen++
+			if q == m.query {
+				return m, nil // already have results for this query
+			}
+			m.query = q
+			return m, fetchSearch(m.tmdb, q)
 		}
 
 		var cmd tea.Cmd
@@ -435,37 +371,46 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil // ignore input while a resolve/play is in flight
 
-	default: // screenBrowsing
+	default: // screenBrowsing — list owns every key not handled below
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "/":
-			m.searching = true
+			m.typing = true
 			m.searchInput.Focus()
 			return m, textinput.Blink
+		case "esc":
+			if m.query != "" {
+				m.query = ""
+				m.searchInput.SetValue("")
+				m.list.Title = "Trending Movies"
+				m.searchErr = nil
+				return m, fetchTrending(m.tmdb)
+			}
+			return m, nil
 		case "enter":
 			if movie, ok := m.selectedMovie(); ok {
-				m.selected = movie
-				m.posterSixel = ""
-				m.posterErr = nil
-				m.screen = screenDetail
-				return m, fetchPoster(movie)
+				return m.openDetail(movie)
 			}
 			return m, nil
 		}
 	}
 
-	return m.updateListNav(msg)
+	var cmd tea.Cmd
+	m.list, cmd = m.list.Update(msg)
+	return m, cmd
 }
 
 var (
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	okStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	warnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
-	errStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	helpStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Align(lipgloss.Right)
-	previewBox = lipgloss.NewStyle().Width(previewPaneWidth).Padding(0, 1)
+	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	okStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	warnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
+	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Align(lipgloss.Right)
+	appStyle     = lipgloss.NewStyle().Padding(1, appMargin)
+	posterColumn = lipgloss.NewStyle().Width(posterMaxWidthPx/8 + 2) // rough px→column estimate
+	ratingStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 )
 
 // helpFor returns the persistent keybinding cheat-sheet for the current
@@ -473,8 +418,8 @@ var (
 func (m model) helpFor() string {
 	var lines []string
 	switch {
-	case m.searching:
-		lines = []string{"↑/↓ navigate results", "enter: details", "esc: cancel search"}
+	case m.typing:
+		lines = []string{"enter/↓: browse results", "esc: cancel"}
 	case m.screen == screenDetail:
 		lines = []string{"enter/p: play", "esc: back", "q: quit"}
 	case m.screen == screenResolving:
@@ -485,6 +430,8 @@ func (m model) helpFor() string {
 	return helpStyle.Render(strings.Join(lines, "\n"))
 }
 
+// header renders the fixed top region: title/status line, then the
+// always-reserved search line, so nothing below it ever jumps.
 func (m model) header() string {
 	status := okStyle.Render("mpv: found")
 	if !m.mpvFound {
@@ -493,70 +440,79 @@ func (m model) header() string {
 	left := titleStyle.Render("ReelShell") + "  " + status
 	help := m.helpFor()
 
-	if m.width <= 0 {
-		return left + "\n" + help + "\n"
+	titleLine := left
+	if m.width > 0 {
+		gap := m.width - appMargin*2 - lipgloss.Width(left) - lipgloss.Width(help)
+		if gap < 1 {
+			gap = 1
+		}
+		titleLine = left + strings.Repeat(" ", gap) + help
 	}
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(help)
-	if gap < 1 {
-		gap = 1
-	}
-	return left + strings.Repeat(" ", gap) + help + "\n"
-}
 
-// previewPane renders the poster (or a placeholder) for whatever's
-// currently highlighted, next to the list.
-func (m model) previewPane() string {
-	body := ""
-	if m.previewSixel != "" {
-		body += m.previewSixel + "\n"
-	} else if m.previewErr != nil {
-		body += dimStyle.Render("(no poster)") + "\n"
-	} else {
-		body += dimStyle.Render("loading poster…") + "\n"
+	searchLine := dimStyle.Render("press / to search")
+	if m.typing {
+		searchLine = m.searchInput.View()
+	} else if m.query != "" {
+		searchLine = dimStyle.Render("/ " + m.query + "  (esc to clear)")
 	}
-	body += "\n" + dimStyle.Render(m.previewMovie.Title)
-	return previewBox.Render(body)
+
+	return titleLine + "\n\n" + searchLine + "\n\n"
 }
 
 func (m model) View() string {
-	header := m.header() + "\n"
+	var content string
 
 	switch m.screen {
 	case screenDetail:
-		return header + m.detailView()
+		content = m.header() + m.detailView()
 	case screenResolving:
-		return header + "resolving \"" + m.selected.Title + "\"…\n\n" + dimStyle.Render("this may take a few seconds")
+		content = m.header() + "resolving \"" + m.selected.Title + "\"…\n\n" + dimStyle.Render("this may take a few seconds")
+	default:
+		content = m.header() + m.browsingView()
 	}
 
-	if m.searching {
-		header += m.searchInput.View() + "\n\n"
-	}
-	if m.loading {
-		return header + dimStyle.Render("loading trending movies…") + "\n"
-	}
-	if m.loadErr != nil {
-		return header + errStyle.Render("failed to load trending movies: "+m.loadErr.Error()) + "\n"
-	}
-	if m.searchErr != nil {
-		header += errStyle.Render("search failed: "+m.searchErr.Error()) + "\n\n"
-	}
-
-	body := lipgloss.JoinHorizontal(lipgloss.Top, m.list.View(), m.previewPane())
-	return header + body + "\n"
+	return appStyle.Render(content)
 }
 
+func (m model) browsingView() string {
+	if m.loading {
+		return dimStyle.Render("loading trending movies…")
+	}
+	if m.loadErr != nil {
+		return errStyle.Render("failed to load trending movies: " + m.loadErr.Error())
+	}
+	if m.searchErr != nil {
+		return errStyle.Render("search failed: "+m.searchErr.Error()) + "\n\n" + m.list.View()
+	}
+	return m.list.View()
+}
+
+// detailView lays the poster and info out as two side-by-side chunks, so
+// the layout stays consistent whether or not a poster actually loads (the
+// poster column always reserves its width).
 func (m model) detailView() string {
-	body := ""
+	posterBlock := dimStyle.Render("loading poster…")
 	if m.posterSixel != "" {
-		body += m.posterSixel + "\n"
+		posterBlock = m.posterSixel
+	} else if m.posterErr != nil {
+		posterBlock = dimStyle.Render("(no poster available)")
 	}
-	body += titleStyle.Render(m.selected.Title) + "\n"
-	body += fmt.Sprintf("★ %.1f\n\n", m.selected.Rating)
-	body += m.selected.Overview + "\n\n"
+
+	infoWidth := m.width - appMargin*2 - lipgloss.Width(posterColumn.Render(""))
+	if infoWidth < 20 {
+		infoWidth = 20
+	}
+	info := lipgloss.NewStyle().Width(infoWidth)
+
+	infoBlock := titleStyle.Render(m.selected.Title) + "\n" +
+		ratingStyle.Render(fmt.Sprintf("★ %.1f", m.selected.Rating)) + "\n\n" +
+		info.Render(m.selected.Overview)
+
 	if m.playErr != nil {
-		body += errStyle.Render("play failed: "+m.playErr.Error()) + "\n\n"
+		infoBlock += "\n\n" + errStyle.Render("play failed: "+m.playErr.Error())
 	}
-	return body
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, posterColumn.Render(posterBlock), infoBlock)
 }
 
 func main() {

@@ -759,7 +759,11 @@ func (m model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc", "backspace":
 		m.screen = screenBrowsing
 		m.playErr = nil
-		return m, nil
+		// The detail screen is the only one that renders a Sixel poster;
+		// browsing's redraw doesn't repaint those pixels, so without a
+		// forced clear the old poster visually lingers/overlaps the list
+		// underneath it.
+		return m, tea.ClearScreen
 	case "s":
 		if m.selected.Kind == discovery.KindAnime {
 			if m.subOrDub == "sub" {
@@ -784,13 +788,13 @@ func (m model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.selected.Kind {
 		case discovery.KindMovie:
 			m.screen = screenResolving
-			return m, resolveAndPlay(m.ctx, m.cfg, m.history, m.selected, m.subOrDub, 0, 0, m.preferredProvider[m.selected.Kind])
+			return m, tea.Batch(tea.ClearScreen, resolveAndPlay(m.ctx, m.cfg, m.history, m.selected, m.subOrDub, 0, 0, m.preferredProvider[m.selected.Kind]))
 		case discovery.KindTV:
 			m.screen = screenSeasonPicker
 			m.seasonsLoad = true
 			m.seasonsErr = nil
 			m.seasonList.SetItems(nil)
-			return m, m.fetchSeasons(m.selected)
+			return m, tea.Batch(tea.ClearScreen, m.fetchSeasons(m.selected))
 		default: // anime
 			m.screen = screenEpisodePicker
 			m.selectedSeason = discovery.TVSeason{}
@@ -799,7 +803,7 @@ func (m model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				items = append(items, episodeItem{e: e})
 			}
 			m.episodeList.SetItems(items)
-			return m, nil
+			return m, tea.ClearScreen
 		}
 	case "q", "ctrl+c":
 		return m.quit()

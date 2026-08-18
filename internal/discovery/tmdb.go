@@ -26,6 +26,21 @@ type tmdbMovieList struct {
 	Results []Movie `json:"results"`
 }
 
+// TVShow mirrors Movie but for TMDB's TV endpoints, which use different
+// field names ("name"/"first_air_date" instead of "title"/"release_date").
+type TVShow struct {
+	ID         int     `json:"id"`
+	Title      string  `json:"name"`
+	Overview   string  `json:"overview"`
+	Rating     float64 `json:"vote_average"`
+	Year       string  `json:"first_air_date"`
+	PosterPath string  `json:"poster_path"`
+}
+
+type tmdbTVList struct {
+	Results []TVShow `json:"results"`
+}
+
 type tmdbErrorBody struct {
 	StatusMessage string `json:"status_message"`
 	StatusCode    int    `json:"status_code"`
@@ -66,6 +81,33 @@ func (c *TMDBClient) SearchMovies(query string) ([]Movie, error) {
 	var list tmdbMovieList
 	if err := json.Unmarshal(body, &list); err != nil {
 		return nil, fmt.Errorf("tmdb: decoding search results: %w", err)
+	}
+	return list.Results, nil
+}
+
+func (c *TMDBClient) TrendingTV() ([]TVShow, error) {
+	body, err := c.get("/trending/tv/day")
+	if err != nil {
+		return nil, err
+	}
+	var list tmdbTVList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("tmdb: decoding trending tv: %w", err)
+	}
+	return list.Results, nil
+}
+
+func (c *TMDBClient) SearchTV(query string) ([]TVShow, error) {
+	if query == "" {
+		return nil, nil
+	}
+	body, err := c.get("/search/tv?query=" + url.QueryEscape(query))
+	if err != nil {
+		return nil, err
+	}
+	var list tmdbTVList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("tmdb: decoding tv search results: %w", err)
 	}
 	return list.Results, nil
 }

@@ -16,21 +16,40 @@ import (
 
 	"github.com/mattn/go-sixel"
 	xdraw "golang.org/x/image/draw"
+
+	"github.com/Sayandeep1013/ReelShell/internal/discovery"
 )
+
+// FetchContent fetches a poster for any discovery.Content, regardless of
+// which source (TMDB path vs AniList full URL) it came from.
+func FetchContent(c discovery.Content, maxWidthPx int) (string, error) {
+	if c.AniListPosterURL != "" {
+		return FetchURL(c.AniListPosterURL, maxWidthPx)
+	}
+	return Fetch(c.TMDBPosterPath, maxWidthPx)
+}
 
 const tmdbImageBase = "https://image.tmdb.org/t/p/w185"
 
-// Fetch downloads and Sixel-encodes a poster, resized to roughly
-// maxWidthPx wide, returning the raw escape-sequence bytes ready to be
-// written straight into a terminal (or embedded in a Bubble Tea View()
-// string).
+// Fetch downloads and Sixel-encodes a TMDB poster (given its poster_path,
+// not a full URL), resized to roughly maxWidthPx wide.
 func Fetch(posterPath string, maxWidthPx int) (string, error) {
 	if posterPath == "" {
 		return "", fmt.Errorf("no poster available for this title")
 	}
+	return FetchURL(tmdbImageBase+posterPath, maxWidthPx)
+}
+
+// FetchURL is the same as Fetch, but for a source (like AniList) that
+// already gives back a full, direct image URL rather than a path to
+// prefix.
+func FetchURL(imageURL string, maxWidthPx int) (string, error) {
+	if imageURL == "" {
+		return "", fmt.Errorf("no poster available for this title")
+	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(tmdbImageBase + posterPath)
+	resp, err := client.Get(imageURL)
 	if err != nil {
 		return "", fmt.Errorf("fetching poster: %w", err)
 	}

@@ -21,29 +21,27 @@ import (
 	"github.com/Sayandeep1013/ReelShell/internal/provider"
 )
 
-// searchDebounce is how long to wait after the last keystroke before firing
-// a real TMDB search request (IMPLEMENTATION_PLAN.md, v0 error table:
-// avoids hitting TMDB's rate limit on every keystroke).
 const searchDebounce = 350 * time.Millisecond
-
-// resolveTimeout bounds how long a provider gets to resolve a stream before
-// it's treated as failed (IMPLEMENTATION_PLAN.md, v0 error table: a hung
-// provider must not freeze the UI).
 const resolveTimeout = 15 * time.Second
-
 const posterMaxWidthPx = 180
 
-// Fixed layout regions, in terminal rows, so switching screens or entering
-// search never shifts anything else on screen:
-//   row 0    : title + mpv status + contextual help
-//   row 1    : blank
-//   row 2    : search line (always reserved, even when empty)
-//   row 3    : blank
-//   row 4... : content (list, or detail screen)
 const (
-	headerRows = 4
-	appMargin  = 2 // horizontal padding so nothing sits flush against the terminal edge
+	headerRows = 5 // title/help, blank, tabs, search line, blank
+	appMargin  = 2
 )
+
+var tabOrder = []discovery.Kind{discovery.KindMovie, discovery.KindTV, discovery.KindAnime}
+
+func tabLabel(k discovery.Kind) string {
+	switch k {
+	case discovery.KindMovie:
+		return "Movies"
+	case discovery.KindTV:
+		return "TV"
+	default:
+		return "Anime"
+	}
+}
 
 type screen int
 
@@ -53,70 +51,57 @@ const (
 	screenResolving
 )
 
-// movieItem adapts discovery.Movie to bubbles/list's list.Item interface.
-type movieItem struct {
-	movie discovery.Movie
-}
+type contentItem struct{ c discovery.Content }
 
-func (i movieItem) Title() string {
+func (i contentItem) Title() string {
 	year := ""
-	if len(i.movie.Year) >= 4 {
-		year = " (" + i.movie.Year[:4] + ")"
+	if len(i.c.Year) >= 4 {
+		year = " (" + i.c.Year[:4] + ")"
 	}
-	return fmt.Sprintf("%s%s", i.movie.Title, year)
+	return i.c.Title + year
 }
-
-func (i movieItem) Description() string {
-	return fmt.Sprintf("★ %.1f", i.movie.Rating)
-}
-
-func (i movieItem) FilterValue() string { return i.movie.Title }
+func (i contentItem) Description() string { return fmt.Sprintf("★ %.1f", i.c.Rating) }
+func (i contentItem) FilterValue() string { return i.c.Title }
 
 type trendingLoadedMsg struct {
-	movies []discovery.Movie
-	err    error
+	tab   discovery.Kind
+	items []discovery.Content
+	err   error
 }
 
 type searchResultsMsg struct {
-	query  string
-	movies []discovery.Movie
-	err    error
+	tab   discovery.Kind
+	query string
+	items []discovery.Content
+	err   error
 }
 
-// debounceFireMsg carries a generation number; if it doesn't match the
-// model's current generation, a newer keystroke has arrived since this
-// timer was scheduled and the search is stale, so it's dropped.
 type debounceFireMsg struct {
 	gen   int
 	query string
 }
 
-type playFinishedMsg struct {
-	err error
-}
+type playFinishedMsg struct{ err error }
 
 type posterLoadedMsg struct {
-	movieID int
-	sixel   string
-	err     error
+	contentID int
+	sixel     string
+	err       error
 }
 
 type model struct {
 	cfg      *config.Config
 	tmdb     *discovery.TMDBClient
+	anilist  *discovery.AniListClient
 	mpvFound bool
-	loading  bool
-	loadErr  error
-	list     list.Model
-	width    int
-	height   int
 
-	// Search has exactly two states: typing (composing a query, textinput
-	// owns the keyboard) and not-typing (the list owns the keyboard,
-	// exactly like plain browsing — no key ever has to be special-cased
-	// between the two, which was the source of the earlier navigation
-	// hassle). query persists as a label after typing ends, so results
-	// stay labeled even once focus has moved to the list.
+	tab     discovery.Kind
+	loading bool
+	loadErr error
+	list    list.Model
+	width   int
+	height  int
+
 	typing      bool
 	searchInput textinput.Model
 	query       string
@@ -124,7 +109,8 @@ type model struct {
 	searchErr   error
 
 	screen      screen
-	selected    discovery.Movie
+	selected    discovery.Content
+	subOrDub    string // "sub" | "dub", anime only
 	posterSixel string
 	posterErr   error
 	playErr     error
@@ -139,19 +125,21 @@ func compactDelegate() list.DefaultDelegate {
 
 func initialModel(cfg *config.Config) model {
 	l := list.New(nil, compactDelegate(), 0, 0)
-	l.Title = "Trending Movies"
+	l.Title = "Trending"
 	l.SetShowStatusBar(false)
-	l.SetShowFilter(false) // we drive search ourselves against TMDB, not the built-in local filter
-	l.SetShowHelp(false)   // replaced by our own persistent help panel
+	l.SetShowFilter(false)
+	l.SetShowHelp(false)
 
 	ti := textinput.New()
-	ti.Placeholder = "search movies…"
+	ti.Placeholder = "search…"
 	ti.Prompt = "/ "
 
 	return model{
 		cfg:         cfg,
 		tmdb:        discovery.NewTMDBClient(cfg.TMDB.APIKey),
+		anilist:     discovery.NewAniListClient(),
 		mpvFound:    player.CheckAvailable(cfg.MPV.Path),
+		tab:         discovery.KindMovie,
 		loading:     true,
 		list:        l,
 		searchInput: ti,
@@ -159,17 +147,59 @@ func initialModel(cfg *config.Config) model {
 	}
 }
 
-func fetchTrending(tmdb *discovery.TMDBClient) tea.Cmd {
+func (m model) fetchTrending(tab discovery.Kind) tea.Cmd {
 	return func() tea.Msg {
-		movies, err := tmdb.TrendingMovies()
-		return trendingLoadedMsg{movies: movies, err: err}
+		var items []discovery.Content
+		var err error
+		switch tab {
+		case discovery.KindMovie:
+			var movies []discovery.Movie
+			movies, err = m.tmdb.TrendingMovies()
+			for _, mv := range movies {
+				items = append(items, discovery.FromMovie(mv))
+			}
+		case discovery.KindTV:
+			var shows []discovery.TVShow
+			shows, err = m.tmdb.TrendingTV()
+			for _, s := range shows {
+				items = append(items, discovery.FromTVShow(s))
+			}
+		case discovery.KindAnime:
+			var anime []discovery.Anime
+			anime, err = m.anilist.TrendingAnime()
+			for _, a := range anime {
+				items = append(items, discovery.FromAnime(a))
+			}
+		}
+		return trendingLoadedMsg{tab: tab, items: items, err: err}
 	}
 }
 
-func fetchSearch(tmdb *discovery.TMDBClient, query string) tea.Cmd {
+func (m model) fetchSearch(tab discovery.Kind, query string) tea.Cmd {
 	return func() tea.Msg {
-		movies, err := tmdb.SearchMovies(query)
-		return searchResultsMsg{query: query, movies: movies, err: err}
+		var items []discovery.Content
+		var err error
+		switch tab {
+		case discovery.KindMovie:
+			var movies []discovery.Movie
+			movies, err = m.tmdb.SearchMovies(query)
+			for _, mv := range movies {
+				items = append(items, discovery.FromMovie(mv))
+			}
+		case discovery.KindTV:
+			var shows []discovery.TVShow
+			shows, err = m.tmdb.SearchTV(query)
+			for _, s := range shows {
+				items = append(items, discovery.FromTVShow(s))
+			}
+		case discovery.KindAnime:
+			var anime []discovery.Anime
+			anime, err = m.anilist.SearchAnime(query)
+			for _, a := range anime {
+				items = append(items, discovery.FromAnime(a))
+			}
+		}
+		return searchResultsMsg{tab: tab, query: query, items: items, err: err}
 	}
 }
 
@@ -179,25 +209,36 @@ func scheduleDebounce(gen int, query string) tea.Cmd {
 	})
 }
 
-func fetchPoster(movie discovery.Movie) tea.Cmd {
+func fetchPoster(c discovery.Content) tea.Cmd {
 	return func() tea.Msg {
-		sixel, err := poster.Fetch(movie.PosterPath, posterMaxWidthPx)
-		return posterLoadedMsg{movieID: movie.ID, sixel: sixel, err: err}
+		sixel, err := poster.FetchContent(c, posterMaxWidthPx)
+		return posterLoadedMsg{contentID: c.ID, sixel: sixel, err: err}
 	}
 }
 
-// resolveAndPlay runs the configured movie provider, then hands the result
-// to mpv. Both steps happen inside one tea.Cmd so the TUI stays responsive
-// while a real subprocess/mpv window runs in the background.
-func resolveAndPlay(cfg *config.Config, movie discovery.Movie) tea.Cmd {
+// resolveAndPlay runs the configured provider for this content's Kind, then
+// hands the result to mpv. For anime, a dub request that fails automatically
+// retries once as sub before surfacing an error (IMPLEMENTATION_PLAN.md v1:
+// most sources don't have every title dubbed, so silently falling back is
+// better UX than a dead end).
+func resolveAndPlay(cfg *config.Config, c discovery.Content, subOrDub string) tea.Cmd {
 	return func() tea.Msg {
-		if len(cfg.Providers.Movie) == 0 {
-			return playFinishedMsg{err: fmt.Errorf("no movie provider configured")}
+		providers := providersFor(cfg, c.Kind)
+		if len(providers) == 0 {
+			return playFinishedMsg{err: fmt.Errorf("no %s provider configured", c.Kind)}
 		}
-		providerExe := cfg.Providers.Movie[0]
+		providerExe := providers[0]
 
-		req := provider.ResolveRequest{Type: "movie", Title: movie.Title, Year: yearInt(movie.Year)}
+		req := provider.ResolveRequest{Type: string(c.Kind), Title: c.Title, Year: yearInt(c.Year)}
+		if c.Kind == discovery.KindAnime {
+			req.SubOrDub = subOrDub
+		}
+
 		res, err := provider.ResolveWithTimeout(providerExe, req, resolveTimeout)
+		if err == nil && !res.OK && c.Kind == discovery.KindAnime && subOrDub == "dub" {
+			req.SubOrDub = "sub"
+			res, err = provider.ResolveWithTimeout(providerExe, req, resolveTimeout)
+		}
 		if err != nil {
 			return playFinishedMsg{err: err}
 		}
@@ -212,42 +253,67 @@ func resolveAndPlay(cfg *config.Config, movie discovery.Movie) tea.Cmd {
 	}
 }
 
+func providersFor(cfg *config.Config, k discovery.Kind) []string {
+	switch k {
+	case discovery.KindMovie:
+		return cfg.Providers.Movie
+	case discovery.KindTV:
+		return cfg.Providers.TV
+	default:
+		return cfg.Providers.Anime
+	}
+}
+
 func yearInt(dateStr string) int {
 	var y int
 	fmt.Sscanf(dateStr, "%4d", &y)
 	return y
 }
 
-func setMovieItems(l *list.Model, movies []discovery.Movie) {
-	items := make([]list.Item, len(movies))
-	for i, mv := range movies {
-		items[i] = movieItem{movie: mv}
+func setContentItems(l *list.Model, items []discovery.Content) {
+	listItems := make([]list.Item, len(items))
+	for i, c := range items {
+		listItems[i] = contentItem{c: c}
 	}
-	l.SetItems(items)
+	l.SetItems(listItems)
 }
 
-func (m model) selectedMovie() (discovery.Movie, bool) {
-	item, ok := m.list.SelectedItem().(movieItem)
+func (m model) selectedContent() (discovery.Content, bool) {
+	item, ok := m.list.SelectedItem().(contentItem)
 	if !ok {
-		return discovery.Movie{}, false
+		return discovery.Content{}, false
 	}
-	return item.movie, true
+	return item.c, true
 }
 
 func (m *model) applyListLayout() {
 	m.list.SetSize(m.width-appMargin*2, m.height-headerRows-appMargin)
 }
 
-func (m model) openDetail(movie discovery.Movie) (model, tea.Cmd) {
-	m.selected = movie
+func (m model) openDetail(c discovery.Content) (model, tea.Cmd) {
+	m.selected = c
+	m.subOrDub = "sub"
 	m.posterSixel = ""
 	m.posterErr = nil
 	m.screen = screenDetail
-	return m, fetchPoster(movie)
+	return m, fetchPoster(c)
+}
+
+// switchTab clears any active search and reloads trending for the new tab.
+func (m model) switchTab(tab discovery.Kind) (model, tea.Cmd) {
+	m.tab = tab
+	m.typing = false
+	m.query = ""
+	m.searchInput.SetValue("")
+	m.searchErr = nil
+	m.loading = true
+	m.loadErr = nil
+	m.list.Title = "Trending " + tabLabel(tab)
+	return m, m.fetchTrending(tab)
 }
 
 func (m model) Init() tea.Cmd {
-	return fetchTrending(m.tmdb)
+	return m.fetchTrending(m.tab)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -259,17 +325,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case trendingLoadedMsg:
+		if msg.tab != m.tab {
+			return m, nil // arrived after the user switched tabs again
+		}
 		m.loading = false
 		if msg.err != nil {
 			m.loadErr = msg.err
 			return m, nil
 		}
-		setMovieItems(&m.list, msg.movies)
+		setContentItems(&m.list, msg.items)
 		return m, nil
 
 	case searchResultsMsg:
-		if msg.query != m.query {
-			return m, nil // stale result from an earlier query, drop it
+		if msg.tab != m.tab || msg.query != m.query {
+			return m, nil // stale: tab or query changed since this was fired
 		}
 		if msg.err != nil {
 			m.searchErr = msg.err
@@ -277,19 +346,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.searchErr = nil
 		m.list.Title = "Search results"
-		setMovieItems(&m.list, msg.movies)
+		setContentItems(&m.list, msg.items)
 		return m, nil
 
 	case debounceFireMsg:
 		if msg.gen != m.searchGen || msg.query == "" {
-			return m, nil // superseded by a newer keystroke, or empty query
+			return m, nil
 		}
 		m.query = msg.query
-		return m, fetchSearch(m.tmdb, msg.query)
+		return m, m.fetchSearch(m.tab, msg.query)
 
 	case posterLoadedMsg:
-		if msg.movieID != m.selected.ID {
-			return m, nil // arrived after the user moved on to a different title
+		if msg.contentID != m.selected.ID {
+			return m, nil
 		}
 		m.posterSixel = msg.sixel
 		m.posterErr = msg.err
@@ -315,16 +384,12 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.query = ""
 			m.searchInput.SetValue("")
 			m.searchInput.Blur()
-			m.list.Title = "Trending Movies"
 			m.searchErr = nil
-			return m, fetchTrending(m.tmdb)
+			m.list.Title = "Trending " + tabLabel(m.tab)
+			return m, m.fetchTrending(m.tab)
 		case "ctrl+c":
 			return m, tea.Quit
 		case "enter", "down":
-			// Commit: hand keyboard focus to the list. If results for the
-			// current input haven't arrived yet, fire an immediate (non-
-			// debounced) search rather than making the user wait out the
-			// debounce window after explicitly asking to move on.
 			m.typing = false
 			m.searchInput.Blur()
 			q := m.searchInput.Value()
@@ -333,10 +398,10 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.searchGen++
 			if q == m.query {
-				return m, nil // already have results for this query
+				return m, nil
 			}
 			m.query = q
-			return m, fetchSearch(m.tmdb, q)
+			return m, m.fetchSearch(m.tab, q)
 		}
 
 		var cmd tea.Cmd
@@ -352,6 +417,15 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen = screenBrowsing
 			m.playErr = nil
 			return m, nil
+		case "s":
+			if m.selected.Kind == discovery.KindAnime {
+				if m.subOrDub == "sub" {
+					m.subOrDub = "dub"
+				} else {
+					m.subOrDub = "sub"
+				}
+			}
+			return m, nil
 		case "enter", "p":
 			if !m.mpvFound {
 				m.playErr = fmt.Errorf("mpv not on PATH, can't play")
@@ -359,7 +433,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.screen = screenResolving
 			m.playErr = nil
-			return m, resolveAndPlay(m.cfg, m.selected)
+			return m, resolveAndPlay(m.cfg, m.selected, m.subOrDub)
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		}
@@ -369,9 +443,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
-		return m, nil // ignore input while a resolve/play is in flight
+		return m, nil
 
-	default: // screenBrowsing — list owns every key not handled below
+	default: // screenBrowsing
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -383,16 +457,22 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.query != "" {
 				m.query = ""
 				m.searchInput.SetValue("")
-				m.list.Title = "Trending Movies"
+				m.list.Title = "Trending " + tabLabel(m.tab)
 				m.searchErr = nil
-				return m, fetchTrending(m.tmdb)
+				return m, m.fetchTrending(m.tab)
 			}
 			return m, nil
 		case "enter":
-			if movie, ok := m.selectedMovie(); ok {
-				return m.openDetail(movie)
+			if c, ok := m.selectedContent(); ok {
+				return m.openDetail(c)
 			}
 			return m, nil
+		case "left", "h":
+			return m.switchTab(prevTab(m.tab))
+		case "right", "l":
+			return m.switchTab(nextTab(m.tab))
+		case "tab":
+			return m.switchTab(nextTab(m.tab))
 		}
 	}
 
@@ -401,20 +481,38 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func prevTab(t discovery.Kind) discovery.Kind {
+	for i, k := range tabOrder {
+		if k == t {
+			return tabOrder[(i-1+len(tabOrder))%len(tabOrder)]
+		}
+	}
+	return t
+}
+
+func nextTab(t discovery.Kind) discovery.Kind {
+	for i, k := range tabOrder {
+		if k == t {
+			return tabOrder[(i+1)%len(tabOrder)]
+		}
+	}
+	return t
+}
+
 var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	okStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	warnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
-	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Align(lipgloss.Right)
-	appStyle     = lipgloss.NewStyle().Padding(1, appMargin)
-	posterColumn = lipgloss.NewStyle().Width(posterMaxWidthPx/8 + 2) // rough px→column estimate
-	ratingStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	okStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	warnStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
+	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	helpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Align(lipgloss.Right)
+	appStyle      = lipgloss.NewStyle().Padding(1, appMargin)
+	posterColumn  = lipgloss.NewStyle().Width(posterMaxWidthPx/8 + 2)
+	ratingStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	activeTabStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Underline(true)
+	inactiveTabStyle = dimStyle
 )
 
-// helpFor returns the persistent keybinding cheat-sheet for the current
-// screen — shown top-right so nothing needs to be memorized.
 func (m model) helpFor() string {
 	var lines []string
 	switch {
@@ -422,16 +520,29 @@ func (m model) helpFor() string {
 		lines = []string{"enter/↓: browse results", "esc: cancel"}
 	case m.screen == screenDetail:
 		lines = []string{"enter/p: play", "esc: back", "q: quit"}
+		if m.selected.Kind == discovery.KindAnime {
+			lines = append([]string{"s: sub/dub"}, lines...)
+		}
 	case m.screen == screenResolving:
 		lines = []string{"please wait…"}
 	default:
-		lines = []string{"↑/↓ navigate", "enter: details", "/ search", "q: quit"}
+		lines = []string{"←/→ switch tab", "↑/↓ navigate", "enter: details", "/ search", "q: quit"}
 	}
 	return helpStyle.Render(strings.Join(lines, "\n"))
 }
 
-// header renders the fixed top region: title/status line, then the
-// always-reserved search line, so nothing below it ever jumps.
+func (m model) tabsLine() string {
+	parts := make([]string, len(tabOrder))
+	for i, k := range tabOrder {
+		style := inactiveTabStyle
+		if k == m.tab {
+			style = activeTabStyle
+		}
+		parts[i] = style.Render(tabLabel(k))
+	}
+	return strings.Join(parts, "   ")
+}
+
 func (m model) header() string {
 	status := okStyle.Render("mpv: found")
 	if !m.mpvFound {
@@ -449,19 +560,23 @@ func (m model) header() string {
 		titleLine = left + strings.Repeat(" ", gap) + help
 	}
 
+	tabs := ""
 	searchLine := dimStyle.Render("press / to search")
-	if m.typing {
-		searchLine = m.searchInput.View()
-	} else if m.query != "" {
-		searchLine = dimStyle.Render("/ " + m.query + "  (esc to clear)")
+	if m.screen == screenBrowsing {
+		tabs = m.tabsLine() + "\n\n"
+		if m.typing {
+			searchLine = m.searchInput.View()
+		} else if m.query != "" {
+			searchLine = dimStyle.Render("/ " + m.query + "  (esc to clear)")
+		}
+		searchLine += "\n"
 	}
 
-	return titleLine + "\n\n" + searchLine + "\n\n"
+	return titleLine + "\n\n" + tabs + searchLine + "\n"
 }
 
 func (m model) View() string {
 	var content string
-
 	switch m.screen {
 	case screenDetail:
 		content = m.header() + m.detailView()
@@ -470,16 +585,15 @@ func (m model) View() string {
 	default:
 		content = m.header() + m.browsingView()
 	}
-
 	return appStyle.Render(content)
 }
 
 func (m model) browsingView() string {
 	if m.loading {
-		return dimStyle.Render("loading trending movies…")
+		return dimStyle.Render("loading…")
 	}
 	if m.loadErr != nil {
-		return errStyle.Render("failed to load trending movies: " + m.loadErr.Error())
+		return errStyle.Render("failed to load: " + m.loadErr.Error())
 	}
 	if m.searchErr != nil {
 		return errStyle.Render("search failed: "+m.searchErr.Error()) + "\n\n" + m.list.View()
@@ -487,9 +601,6 @@ func (m model) browsingView() string {
 	return m.list.View()
 }
 
-// detailView lays the poster and info out as two side-by-side chunks, so
-// the layout stays consistent whether or not a poster actually loads (the
-// poster column always reserves its width).
 func (m model) detailView() string {
 	posterBlock := dimStyle.Render("loading poster…")
 	if m.posterSixel != "" {
@@ -505,8 +616,11 @@ func (m model) detailView() string {
 	info := lipgloss.NewStyle().Width(infoWidth)
 
 	infoBlock := titleStyle.Render(m.selected.Title) + "\n" +
-		ratingStyle.Render(fmt.Sprintf("★ %.1f", m.selected.Rating)) + "\n\n" +
-		info.Render(m.selected.Overview)
+		ratingStyle.Render(fmt.Sprintf("★ %.1f", m.selected.Rating))
+	if m.selected.Kind == discovery.KindAnime {
+		infoBlock += dimStyle.Render("  [" + strings.ToUpper(m.subOrDub) + "]")
+	}
+	infoBlock += "\n\n" + info.Render(m.selected.Overview)
 
 	if m.playErr != nil {
 		infoBlock += "\n\n" + errStyle.Render("play failed: "+m.playErr.Error())

@@ -20,7 +20,8 @@ func TestResolveAndPlayDummyProvider(t *testing.T) {
 		},
 	}
 
-	cmd := resolveAndPlay(cfg, discovery.Movie{Title: "Integration Test Movie", Year: "2020-01-01"})
+	content := discovery.FromMovie(discovery.Movie{Title: "Integration Test Movie", Year: "2020-01-01"})
+	cmd := resolveAndPlay(cfg, content, "")
 	msg := cmd()
 
 	result, ok := msg.(playFinishedMsg)

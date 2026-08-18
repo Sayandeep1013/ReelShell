@@ -39,8 +39,10 @@ func CheckAvailable(mpvPath string) bool {
 }
 
 // Play writes the shared input.conf into DataDir (once) and launches mpv
-// against a resolved stream, passing through headers and an external
-// subtitle if the provider supplied them.
+// against a resolved stream, passing through headers and any subtitle
+// tracks the provider supplied. Multiple subtitles (different languages)
+// each get their own --sub-file flag, so mpv's own `c` (cycle sub)
+// keybind switches between them (SPEC.md v2: multi-language subtitles).
 func Play(mpvPath string, res *provider.ResolveResponse) error {
 	if mpvPath == "" {
 		mpvPath = "mpv"
@@ -61,8 +63,10 @@ func Play(mpvPath string, res *provider.ResolveResponse) error {
 		args = append(args, "--http-header-fields="+strings.Join(fields, ","))
 	}
 
-	if res.SubtitleURL != "" {
-		args = append(args, "--sub-file="+res.SubtitleURL)
+	for _, sub := range res.Subtitles {
+		if sub.URL != "" {
+			args = append(args, "--sub-file="+sub.URL)
+		}
 	}
 
 	cmd := exec.Command(mpvPath, args...)

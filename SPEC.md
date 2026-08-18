@@ -103,16 +103,20 @@ A provider is a standalone executable (any language) living in `G:\ReelShell\pro
   "ok": true,
   "url": "https://... or http://127.0.0.1:PORT/stream",
   "headers": { "Referer": "...", "User-Agent": "..." },
-  "subtitle_url": "https://... (optional)"
+  "subtitles": [
+    { "lang": "en", "url": "https://..." },
+    { "lang": "ja", "url": "https://..." }
+  ]
 }
 ```
+`subtitles` is optional and can hold more than one track (v2: multi-language subtitles) — each gets its own `--sub-file` when handed to mpv, and the `c` keybind (§4) cycles between them.
 
 **stdout** (JSON), failure:
 ```json
 { "ok": false, "error": "human-readable reason" }
 ```
 
-`rlshl` passes `url`/`headers`/`subtitle_url` straight to `mpv` (`--http-header-fields`, `--sub-file`).
+`rlshl` passes `url`/`headers`/`subtitles` straight to `mpv` (`--http-header-fields`, one `--sub-file` per subtitle).
 
 **Torrent-based providers** (e.g. a Nyaa provider) fit this same protocol without any core changes: internally they start a local sequential-download BitTorrent-streaming engine (e.g. Go's `anacrolix/torrent`) and return `http://127.0.0.1:PORT/stream` as `url`, exactly like an HTTP-source provider.
 

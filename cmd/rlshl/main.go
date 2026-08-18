@@ -13,7 +13,9 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/sahilm/fuzzy"
 
+	"github.com/Sayandeep1013/ReelShell/internal/cache"
 	"github.com/Sayandeep1013/ReelShell/internal/config"
 	"github.com/Sayandeep1013/ReelShell/internal/discovery"
 	"github.com/Sayandeep1013/ReelShell/internal/history"
@@ -25,6 +27,12 @@ import (
 const searchDebounce = 350 * time.Millisecond
 const resolveTimeout = 15 * time.Second
 const posterMaxWidthPx = 180
+
+// discoveryCacheTTL: how long a trending/search response stays cached
+// before a repeat request hits TMDB/AniList again. 5 minutes is plenty for
+// "trending" (which doesn't change that fast) and search-result reuse
+// while switching tabs and back.
+const discoveryCacheTTL = 5 * time.Minute
 
 // continueWatchingCount: how many recently-watched items to prepend to a
 // tab's trending list. Kept small and simple for v1 — these entries carry
@@ -142,14 +150,16 @@ type model struct {
 	tmdb     *discovery.TMDBClient
 	anilist  *discovery.AniListClient
 	history  *history.DB // nil if it failed to open — history features silently no-op
+	dcache   *cache.Cache
 	mpvFound bool
 
-	tab     discovery.Kind
-	loading bool
-	loadErr error
-	list    list.Model
-	width   int
-	height  int
+	tab         discovery.Kind
+	loading     bool
+	loadErr     error
+	list        list.Model
+	cachedItems []discovery.Content // source for instant local fuzzy filtering while typing
+	width       int
+	height      int
 
 	typing      bool
 	searchInput textinput.Model
@@ -209,6 +219,7 @@ func initialModel(cfg *config.Config, hist *history.DB) model {
 		tmdb:        discovery.NewTMDBClient(cfg.TMDB.APIKey),
 		anilist:     discovery.NewAniListClient(),
 		history:     hist,
+		dcache:      cache.New(discoveryCacheTTL),
 		mpvFound:    player.CheckAvailable(cfg.MPV.Path),
 		tab:         discovery.KindMovie,
 		loading:     true,
@@ -237,6 +248,12 @@ func (m model) recentlyWatched(tab discovery.Kind) []discovery.Content {
 
 func (m model) fetchTrending(tab discovery.Kind) tea.Cmd {
 	return func() tea.Msg {
+		cacheKey := "trending:" + string(tab)
+		if cached, ok := m.dcache.Get(cacheKey); ok {
+			items := append(m.recentlyWatched(tab), cached.([]discovery.Content)...)
+			return trendingLoadedMsg{tab: tab, items: items}
+		}
+
 		var items []discovery.Content
 		var err error
 		switch tab {
@@ -259,6 +276,9 @@ func (m model) fetchTrending(tab discovery.Kind) tea.Cmd {
 				items = append(items, discovery.FromAnime(a))
 			}
 		}
+		if err == nil {
+			m.dcache.Set(cacheKey, items)
+		}
 		items = append(m.recentlyWatched(tab), items...)
 		return trendingLoadedMsg{tab: tab, items: items, err: err}
 	}
@@ -266,6 +286,11 @@ func (m model) fetchTrending(tab discovery.Kind) tea.Cmd {
 
 func (m model) fetchSearch(tab discovery.Kind, query string) tea.Cmd {
 	return func() tea.Msg {
+		cacheKey := "search:" + string(tab) + ":" + query
+		if cached, ok := m.dcache.Get(cacheKey); ok {
+			return searchResultsMsg{tab: tab, query: query, items: cached.([]discovery.Content)}
+		}
+
 		var items []discovery.Content
 		var err error
 		switch tab {
@@ -287,6 +312,9 @@ func (m model) fetchSearch(tab discovery.Kind, query string) tea.Cmd {
 			for _, a := range anime {
 				items = append(items, discovery.FromAnime(a))
 			}
+		}
+		if err == nil {
+			m.dcache.Set(cacheKey, items)
 		}
 		return searchResultsMsg{tab: tab, query: query, items: items, err: err}
 	}
@@ -338,43 +366,52 @@ func animeEpisodes(c discovery.Content) []episodeRef {
 	return refs
 }
 
-// resolveAndPlay runs the configured provider for this content's Kind, then
-// hands the result to mpv, then records it to history on success. For
-// anime, a dub request that fails automatically retries once as sub
+// resolveAndPlay tries every configured provider for this content's Kind in
+// order, stopping at the first success (SPEC.md v2: multi-provider
+// fallback). For anime, a dub request that fails is retried once as sub on
+// that same provider before moving to the next provider in the chain
 // (IMPLEMENTATION_PLAN.md v1: most sources don't have every title dubbed).
+// On success, hands the result to mpv and records it to history.
 func resolveAndPlay(cfg *config.Config, hist *history.DB, c discovery.Content, subOrDub string, season, episode int) tea.Cmd {
 	return func() tea.Msg {
 		providers := providersFor(cfg, c.Kind)
 		if len(providers) == 0 {
 			return playFinishedMsg{err: fmt.Errorf("no %s provider configured", c.Kind)}
 		}
-		providerExe := providers[0]
 
-		req := provider.ResolveRequest{Type: string(c.Kind), Title: c.Title, Year: yearInt(c.Year), Season: season, Episode: episode}
-		if c.Kind == discovery.KindAnime {
-			req.SubOrDub = subOrDub
+		var lastErr error
+		for _, providerExe := range providers {
+			req := provider.ResolveRequest{Type: string(c.Kind), Title: c.Title, Year: yearInt(c.Year), Season: season, Episode: episode}
+			if c.Kind == discovery.KindAnime {
+				req.SubOrDub = subOrDub
+			}
+
+			res, err := provider.ResolveWithTimeout(providerExe, req, resolveTimeout)
+			if err == nil && !res.OK && c.Kind == discovery.KindAnime && subOrDub == "dub" {
+				req.SubOrDub = "sub"
+				res, err = provider.ResolveWithTimeout(providerExe, req, resolveTimeout)
+			}
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if !res.OK {
+				lastErr = fmt.Errorf("provider %s: %s", providerExe, res.Error)
+				continue
+			}
+
+			if err := player.Play(cfg.MPV.Path, res); err != nil {
+				lastErr = fmt.Errorf("mpv: %w", err)
+				continue
+			}
+
+			if hist != nil {
+				_ = hist.MarkWatched(string(c.Kind), c.ID, c.Title, season, episode)
+			}
+			return playFinishedMsg{err: nil}
 		}
 
-		res, err := provider.ResolveWithTimeout(providerExe, req, resolveTimeout)
-		if err == nil && !res.OK && c.Kind == discovery.KindAnime && subOrDub == "dub" {
-			req.SubOrDub = "sub"
-			res, err = provider.ResolveWithTimeout(providerExe, req, resolveTimeout)
-		}
-		if err != nil {
-			return playFinishedMsg{err: err}
-		}
-		if !res.OK {
-			return playFinishedMsg{err: fmt.Errorf("provider: %s", res.Error)}
-		}
-
-		if err := player.Play(cfg.MPV.Path, res); err != nil {
-			return playFinishedMsg{err: fmt.Errorf("mpv: %w", err)}
-		}
-
-		if hist != nil {
-			_ = hist.MarkWatched(string(c.Kind), c.ID, c.Title, season, episode)
-		}
-		return playFinishedMsg{err: nil}
+		return playFinishedMsg{err: fmt.Errorf("all providers failed, last error: %w", lastErr)}
 	}
 }
 
@@ -460,6 +497,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadErr = msg.err
 			return m, nil
 		}
+		m.cachedItems = msg.items
 		setContentItems(&m.list, msg.items)
 		return m, nil
 
@@ -473,6 +511,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.searchErr = nil
 		m.list.Title = "Search results"
+		m.cachedItems = msg.items
 		setContentItems(&m.list, msg.items)
 		return m, nil
 
@@ -587,7 +626,31 @@ func (m model) handleTypingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.searchInput, cmd = m.searchInput.Update(msg)
 	m.searchGen++
-	return m, tea.Batch(cmd, scheduleDebounce(m.searchGen, m.searchInput.Value()))
+
+	// Instant local fuzzy match over whatever's already loaded, so typing
+	// feels immediate; the debounced call below still fires and replaces
+	// these with authoritative results once the real API responds.
+	q := m.searchInput.Value()
+	if q != "" && len(m.cachedItems) > 0 {
+		setContentItems(&m.list, fuzzyFilter(m.cachedItems, q))
+	}
+
+	return m, tea.Batch(cmd, scheduleDebounce(m.searchGen, q))
+}
+
+// fuzzyFilter ranks cachedItems by fuzzy match against query, using
+// sahilm/fuzzy (already a transitive dependency via bubbles/list).
+func fuzzyFilter(items []discovery.Content, query string) []discovery.Content {
+	titles := make([]string, len(items))
+	for i, c := range items {
+		titles[i] = c.Title
+	}
+	matches := fuzzy.Find(query, titles)
+	result := make([]discovery.Content, len(matches))
+	for i, match := range matches {
+		result[i] = items[match.Index]
+	}
+	return result
 }
 
 func (m model) handleBrowsingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

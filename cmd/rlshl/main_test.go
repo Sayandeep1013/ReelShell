@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Sayandeep1013/ReelShell/internal/config"
@@ -21,7 +22,7 @@ func TestResolveAndPlayDummyProvider(t *testing.T) {
 	}
 
 	content := discovery.FromMovie(discovery.Movie{Title: "Integration Test Movie", Year: "2020-01-01"})
-	cmd := resolveAndPlay(cfg, nil, content, "", 0, 0, 0)
+	cmd := resolveAndPlay(context.Background(), cfg, nil, content, "", 0, 0, 0)
 	msg := cmd()
 
 	result, ok := msg.(playFinishedMsg)

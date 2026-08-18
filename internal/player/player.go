@@ -5,6 +5,7 @@ package player
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"fmt"
 	"os"
@@ -43,7 +44,12 @@ func CheckAvailable(mpvPath string) bool {
 // tracks the provider supplied. Multiple subtitles (different languages)
 // each get their own --sub-file flag, so mpv's own `c` (cycle sub)
 // keybind switches between them (SPEC.md v2: multi-language subtitles).
-func Play(mpvPath string, res *provider.ResolveResponse) error {
+//
+// ctx being cancelled (e.g. the user quits ReelShell while mpv is still
+// playing) kills the mpv child process rather than leaving it orphaned —
+// on Windows, a child process is not otherwise terminated just because its
+// parent exited.
+func Play(ctx context.Context, mpvPath string, res *provider.ResolveResponse) error {
 	if mpvPath == "" {
 		mpvPath = "mpv"
 	}
@@ -69,7 +75,7 @@ func Play(mpvPath string, res *provider.ResolveResponse) error {
 		}
 	}
 
-	cmd := exec.Command(mpvPath, args...)
+	cmd := exec.CommandContext(ctx, mpvPath, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 

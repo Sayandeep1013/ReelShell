@@ -4,6 +4,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -128,25 +130,36 @@ type debounceFireMsg struct {
 
 type playFinishedMsg struct{ err error }
 
+// contentID alone isn't a safe staleness key: TMDB and AniList IDs are
+// independent small integer spaces that can collide (e.g. a movie and an
+// anime both with ID 550) — every one of these messages also carries Kind
+// so a same-ID-different-source race can't cross-contaminate the screen.
 type posterLoadedMsg struct {
+	kind      discovery.Kind
 	contentID int
 	sixel     string
 	err       error
 }
 
 type seasonsLoadedMsg struct {
+	kind      discovery.Kind
 	contentID int
 	seasons   []discovery.TVSeason
 	err       error
 }
 
 type episodesLoadedMsg struct {
+	kind      discovery.Kind
 	contentID int
+	season    int // guards against two in-flight season fetches racing
 	episodes  []episodeRef
 	err       error
 }
 
 type model struct {
+	ctx    context.Context
+	cancel context.CancelFunc // called on every quit path so an in-flight mpv/provider subprocess gets killed rather than orphaned
+
 	cfg      *config.Config
 	tmdb     *discovery.TMDBClient
 	anilist  *discovery.AniListClient
@@ -199,7 +212,7 @@ func compactDelegate() list.DefaultDelegate {
 	return d
 }
 
-func initialModel(cfg *config.Config, hist *history.DB) model {
+func initialModel(ctx context.Context, cancel context.CancelFunc, cfg *config.Config, hist *history.DB) model {
 	l := list.New(nil, compactDelegate(), 0, 0)
 	l.Title = "Trending"
 	l.SetShowStatusBar(false)
@@ -223,6 +236,8 @@ func initialModel(cfg *config.Config, hist *history.DB) model {
 	ti.Prompt = "/ "
 
 	return model{
+		ctx:               ctx,
+		cancel:            cancel,
 		cfg:               cfg,
 		tmdb:              discovery.NewTMDBClient(cfg.TMDB.APIKey),
 		anilist:           discovery.NewAniListClient(),
@@ -338,14 +353,14 @@ func scheduleDebounce(gen int, query string) tea.Cmd {
 func fetchPoster(c discovery.Content) tea.Cmd {
 	return func() tea.Msg {
 		sixel, err := poster.FetchContent(c, posterMaxWidthPx)
-		return posterLoadedMsg{contentID: c.ID, sixel: sixel, err: err}
+		return posterLoadedMsg{kind: c.Kind, contentID: c.ID, sixel: sixel, err: err}
 	}
 }
 
 func (m model) fetchSeasons(c discovery.Content) tea.Cmd {
 	return func() tea.Msg {
 		seasons, err := m.tmdb.TVSeasons(c.ID)
-		return seasonsLoadedMsg{contentID: c.ID, seasons: seasons, err: err}
+		return seasonsLoadedMsg{kind: c.Kind, contentID: c.ID, seasons: seasons, err: err}
 	}
 }
 
@@ -356,7 +371,7 @@ func (m model) fetchTVEpisodes(c discovery.Content, season int) tea.Cmd {
 		for i, e := range eps {
 			refs[i] = episodeRef{number: e.EpisodeNumber, label: fmt.Sprintf("%d. %s", e.EpisodeNumber, e.Name)}
 		}
-		return episodesLoadedMsg{contentID: c.ID, episodes: refs, err: err}
+		return episodesLoadedMsg{kind: c.Kind, contentID: c.ID, season: season, episodes: refs, err: err}
 	}
 }
 
@@ -383,14 +398,14 @@ func animeEpisodes(c discovery.Content) []episodeRef {
 // retried once as sub on that same provider before moving to the next
 // (IMPLEMENTATION_PLAN.md v1: most sources don't have every title dubbed).
 // On success, hands the result to mpv and records it to history.
-func resolveAndPlay(cfg *config.Config, hist *history.DB, c discovery.Content, subOrDub string, season, episode, preferredIdx int) tea.Cmd {
+func resolveAndPlay(ctx context.Context, cfg *config.Config, hist *history.DB, c discovery.Content, subOrDub string, season, episode, preferredIdx int) tea.Cmd {
 	return func() tea.Msg {
 		providers := orderedProviders(providersFor(cfg, c.Kind), preferredIdx)
 		if len(providers) == 0 {
 			return playFinishedMsg{err: fmt.Errorf("no %s provider configured", c.Kind)}
 		}
 
-		var lastErr error
+		var errs []error
 		for _, providerExe := range providers {
 			req := provider.ResolveRequest{Type: string(c.Kind), Title: c.Title, Year: yearInt(c.Year), Season: season, Episode: episode}
 			if c.Kind == discovery.KindAnime {
@@ -403,16 +418,16 @@ func resolveAndPlay(cfg *config.Config, hist *history.DB, c discovery.Content, s
 				res, err = provider.ResolveWithTimeout(providerExe, req, resolveTimeout)
 			}
 			if err != nil {
-				lastErr = err
+				errs = append(errs, fmt.Errorf("%s: %w", providerName(providerExe), err))
 				continue
 			}
 			if !res.OK {
-				lastErr = fmt.Errorf("provider %s: %s", providerExe, res.Error)
+				errs = append(errs, fmt.Errorf("%s: %s", providerName(providerExe), res.Error))
 				continue
 			}
 
-			if err := player.Play(cfg.MPV.Path, res); err != nil {
-				lastErr = fmt.Errorf("mpv: %w", err)
+			if err := player.Play(ctx, cfg.MPV.Path, res); err != nil {
+				errs = append(errs, fmt.Errorf("%s (mpv): %w", providerName(providerExe), err))
 				continue
 			}
 
@@ -422,7 +437,7 @@ func resolveAndPlay(cfg *config.Config, hist *history.DB, c discovery.Content, s
 			return playFinishedMsg{err: nil}
 		}
 
-		return playFinishedMsg{err: fmt.Errorf("all providers failed, last error: %w", lastErr)}
+		return playFinishedMsg{err: fmt.Errorf("all providers failed: %w", errors.Join(errs...))}
 	}
 }
 
@@ -476,11 +491,20 @@ func (m model) selectedContent() (discovery.Content, bool) {
 	return item.c, true
 }
 
+const minListWidth, minListHeight = 20, 3
+
 func (m *model) applyListLayout() {
+	w := m.width - appMargin*2
+	if w < minListWidth {
+		w = minListWidth
+	}
 	h := m.height - headerRows - appMargin
-	m.list.SetSize(m.width-appMargin*2, h)
-	m.seasonList.SetSize(m.width-appMargin*2, h)
-	m.episodeList.SetSize(m.width-appMargin*2, h)
+	if h < minListHeight {
+		h = minListHeight
+	}
+	m.list.SetSize(w, h)
+	m.seasonList.SetSize(w, h)
+	m.episodeList.SetSize(w, h)
 }
 
 func (m model) openDetail(c discovery.Content) (model, tea.Cmd) {
@@ -502,6 +526,15 @@ func (m model) switchTab(tab discovery.Kind) (model, tea.Cmd) {
 	m.loadErr = nil
 	m.list.Title = "Trending " + tabLabel(tab)
 	return m, m.fetchTrending(tab)
+}
+
+// quit cancels m.ctx before returning tea.Quit, so any in-flight
+// resolveAndPlay goroutine kills its mpv/provider subprocess via
+// exec.CommandContext instead of leaving it orphaned (Windows does not
+// terminate child processes just because the parent exited).
+func (m model) quit() (tea.Model, tea.Cmd) {
+	m.cancel()
+	return m, tea.Quit
 }
 
 func (m model) Init() tea.Cmd {
@@ -551,7 +584,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.fetchSearch(m.tab, msg.query)
 
 	case posterLoadedMsg:
-		if msg.contentID != m.selected.ID {
+		if msg.kind != m.selected.Kind || msg.contentID != m.selected.ID {
 			return m, nil
 		}
 		m.posterSixel = msg.sixel
@@ -559,7 +592,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case seasonsLoadedMsg:
-		if msg.contentID != m.selected.ID {
+		if msg.kind != m.selected.Kind || msg.contentID != m.selected.ID {
 			return m, nil
 		}
 		m.seasonsLoad = false
@@ -575,7 +608,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case episodesLoadedMsg:
-		if msg.contentID != m.selected.ID {
+		if msg.kind != m.selected.Kind || msg.contentID != m.selected.ID || msg.season != m.selectedSeason.SeasonNumber {
 			return m, nil
 		}
 		m.episodesLoad = false
@@ -616,7 +649,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleEpisodePickerKey(msg)
 	case screenResolving:
 		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
+			return m.quit()
 		}
 		return m, nil
 	default:
@@ -632,10 +665,12 @@ func (m model) handleTypingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.searchInput.SetValue("")
 		m.searchInput.Blur()
 		m.searchErr = nil
+		m.searchGen++ // invalidate any debounce timer still pending from before Esc
 		m.list.Title = "Trending " + tabLabel(m.tab)
+		setContentItems(&m.list, m.cachedItems)
 		return m, m.fetchTrending(m.tab)
 	case "ctrl+c":
-		return m, tea.Quit
+		return m.quit()
 	case "enter", "down":
 		m.typing = false
 		m.searchInput.Blur()
@@ -661,6 +696,11 @@ func (m model) handleTypingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	q := m.searchInput.Value()
 	if q != "" && len(m.cachedItems) > 0 {
 		setContentItems(&m.list, fuzzyFilter(m.cachedItems, q))
+	} else if q == "" {
+		// Backspaced back to empty: show the unfiltered set immediately
+		// rather than leaving the last query's stale filtered results on
+		// screen — don't wait for Esc to notice the box is empty.
+		setContentItems(&m.list, m.cachedItems)
 	}
 
 	return m, tea.Batch(cmd, scheduleDebounce(m.searchGen, q))
@@ -684,7 +724,7 @@ func fuzzyFilter(items []discovery.Content, query string) []discovery.Content {
 func (m model) handleBrowsingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
-		return m, tea.Quit
+		return m.quit()
 	case "/":
 		m.typing = true
 		m.searchInput.Focus()
@@ -744,7 +784,7 @@ func (m model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.selected.Kind {
 		case discovery.KindMovie:
 			m.screen = screenResolving
-			return m, resolveAndPlay(m.cfg, m.history, m.selected, m.subOrDub, 0, 0, m.preferredProvider[m.selected.Kind])
+			return m, resolveAndPlay(m.ctx, m.cfg, m.history, m.selected, m.subOrDub, 0, 0, m.preferredProvider[m.selected.Kind])
 		case discovery.KindTV:
 			m.screen = screenSeasonPicker
 			m.seasonsLoad = true
@@ -762,7 +802,7 @@ func (m model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case "q", "ctrl+c":
-		return m, tea.Quit
+		return m.quit()
 	}
 	return m, nil
 }
@@ -784,7 +824,7 @@ func (m model) handleSeasonPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.episodeList.SetItems(nil)
 		return m, m.fetchTVEpisodes(m.selected, item.s.SeasonNumber)
 	case "q", "ctrl+c":
-		return m, tea.Quit
+		return m.quit()
 	}
 	var cmd tea.Cmd
 	m.seasonList, cmd = m.seasonList.Update(msg)
@@ -806,9 +846,9 @@ func (m model) handleEpisodePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.screen = screenResolving
-		return m, resolveAndPlay(m.cfg, m.history, m.selected, m.subOrDub, m.selectedSeason.SeasonNumber, item.e.number, m.preferredProvider[m.selected.Kind])
+		return m, resolveAndPlay(m.ctx, m.cfg, m.history, m.selected, m.subOrDub, m.selectedSeason.SeasonNumber, item.e.number, m.preferredProvider[m.selected.Kind])
 	case "q", "ctrl+c":
-		return m, tea.Quit
+		return m.quit()
 	}
 	var cmd tea.Cmd
 	m.episodeList, cmd = m.episodeList.Update(msg)
@@ -888,15 +928,20 @@ func (m model) header() string {
 		status = warnStyle.Render("mpv: NOT on PATH")
 	}
 	left := titleStyle.Render("ReelShell") + "  " + status
-	help := m.helpFor()
+	help := m.helpFor() // may be multiple lines (e.g. detail screen), never assume single-line
 
 	titleLine := left
 	if m.width > 0 {
-		gap := m.width - appMargin*2 - lipgloss.Width(left) - lipgloss.Width(help)
-		if gap < 1 {
-			gap = 1
+		leftWidth := m.width - appMargin*2 - lipgloss.Width(help)
+		if leftWidth < lipgloss.Width(left) {
+			leftWidth = lipgloss.Width(left)
 		}
-		titleLine = left + strings.Repeat(" ", gap) + help
+		// JoinHorizontal (not string concatenation) is required here: help
+		// can be multi-line, and naive concatenation would put only its
+		// first line next to the title, dumping the rest at column 0 on
+		// the following rows.
+		leftBlock := lipgloss.NewStyle().Width(leftWidth).Render(left)
+		titleLine = lipgloss.JoinHorizontal(lipgloss.Top, leftBlock, help)
 	}
 
 	tabs := ""
@@ -1004,7 +1049,10 @@ func main() {
 		defer hist.Close()
 	}
 
-	p := tea.NewProgram(initialModel(cfg, hist), tea.WithAltScreen())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := tea.NewProgram(initialModel(ctx, cancel, cfg, hist), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

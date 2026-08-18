@@ -6,6 +6,7 @@ package discovery
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -176,16 +177,9 @@ func (c *TMDBClient) get(path string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	body := make([]byte, 0, 4096)
-	buf := make([]byte, 4096)
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			body = append(body, buf[:n]...)
-		}
-		if readErr != nil {
-			break
-		}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("tmdb: reading response body: %w", err)
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {

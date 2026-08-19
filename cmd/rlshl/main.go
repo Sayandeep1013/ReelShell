@@ -897,7 +897,11 @@ func (m model) helpFor() string {
 	case m.typing:
 		lines = []string{"enter/↓: browse results", "esc: cancel"}
 	case m.screen == screenDetail:
-		lines = []string{"enter/p: play", "esc: back", "q: quit"}
+		playHint := "enter/p: play"
+		if m.selected.Kind == discovery.KindTV {
+			playHint = "enter/p: pick season"
+		}
+		lines = []string{playHint, "esc: back", "q: quit"}
 		if len(providersFor(m.cfg, m.selected.Kind)) > 1 {
 			lines = append([]string{"n: next provider"}, lines...)
 		}

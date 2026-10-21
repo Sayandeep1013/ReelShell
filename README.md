@@ -8,6 +8,17 @@ We're making a terminal-native tool where you can browse movies, series, and ani
 
 Reference points for the space: tools like Sonarr and Radarr (and similar indexers/library managers), plus some anime-related APKs that were tested separately (not part of this repo).
 
+## Install
+
+Needs Go 1.26+ and [mpv](https://mpv.io) on your `PATH`.
+
+```sh
+go install github.com/Sayandeep1013/ReelShell/cmd/rlshl@latest
+rlshl
+```
+
+Movies and TV need a free TMDB API key in `config.toml`; see [SPEC.md](./SPEC.md).
+
 ## Spec
 
 Full design: [SPEC.md](./SPEC.md).

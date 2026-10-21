@@ -1,5 +1,8 @@
 # ReelShell
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/Sayandeep1013/ReelShell.svg)](https://pkg.go.dev/github.com/Sayandeep1013/ReelShell)
+[![Release](https://img.shields.io/github/v/tag/Sayandeep1013/ReelShell?label=version)](https://github.com/Sayandeep1013/ReelShell/tags)
+
 A terminal-native tool to browse movies, series, and anime, and watch them for free — all from the terminal.
 
 ## Idea
